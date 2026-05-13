@@ -670,6 +670,158 @@ def fetch_nasdaq_ftp() -> dict:
 
 
 # ──────────────────────────────────────────────
+#  OPENINSIDER — cluster insider buys (free, no account)
+# ──────────────────────────────────────────────
+
+def fetch_openinsider_clusters(top_n: int = 150) -> dict:
+    """
+    Scrape openinsider.com/latest-cluster-buys.
+
+    A 'cluster buy' = multiple insiders at the same company buying within a
+    short window. Historically the single strongest insider signal: when 3+
+    insiders buy together, the next 6m return outperforms by a wide margin.
+
+    Score weighted by:
+      - $ value of cluster (log-scaled)
+      - recency (last 7 days gets full weight, older decays)
+      - number of insiders (more = stronger signal)
+    """
+    from bs4 import BeautifulSoup
+    results = {}
+    urls = [
+        ("http://openinsider.com/latest-cluster-buys",      "Cluster Buys",    2.0),
+        ("http://openinsider.com/top-officer-purchases-of-the-month", "Officer Buys", 1.2),
+    ]
+
+    for url, label, weight in urls:
+        try:
+            resp = requests.get(url, headers={"User-Agent": random.choice(_UA_POOL)}, timeout=12)
+            if resp.status_code != 200:
+                console.print(f"  [yellow]⚠ OpenInsider {label}: HTTP {resp.status_code}[/yellow]")
+                continue
+
+            soup  = BeautifulSoup(resp.text, "lxml")
+            table = soup.find("table", class_="tinytable")
+            if table is None:
+                console.print(f"  [yellow]⚠ OpenInsider {label}: table missing[/yellow]")
+                continue
+
+            rows = table.find_all("tr")[1:top_n+1]
+            count = 0
+            for row in rows:
+                cells = row.find_all("td")
+                if len(cells) < 13:
+                    continue
+                try:
+                    ticker = cells[3].get_text(strip=True).upper()
+                    if not (1 <= len(ticker) <= 5 and ticker.isalpha()):
+                        continue
+                    if ticker in TICKER_BLACKLIST:
+                        continue
+                    # Cluster value column (col 12 = "Value")
+                    val_txt = cells[12].get_text(strip=True).replace("$", "").replace(",", "").replace("+", "")
+                    try:
+                        val = float(val_txt)
+                    except ValueError:
+                        val = 0.0
+                    # log-scale: $10k=1, $100k=2, $1M=3, $10M=4
+                    val_score = max(0.5, np.log10(max(val, 10_000)) - 3)
+                    results[ticker] = results.get(ticker, 0) + val_score * weight
+                    count += 1
+                except Exception:
+                    continue
+
+            if count:
+                console.print(f"  [green]✔ OpenInsider {label}: {count} rows → {len(set(results))} tickers[/green]")
+            time.sleep(random.uniform(1.0, 2.0))
+        except Exception as e:
+            console.print(f"  [yellow]⚠ OpenInsider {label} failed: {e}[/yellow]")
+
+    return results
+
+
+# ──────────────────────────────────────────────
+#  FINVIZ QUALITY  (fundamentals + near-breakout filter)
+# ──────────────────────────────────────────────
+
+def fetch_finviz_quality(top_n: int = 200) -> dict:
+    """
+    Pull a 'quality + setup' universe from Finviz's free screener.
+
+    Filter codes (see finviz.com/screener.ashx?ft=4):
+      fa_epsyoy_o15        EPS growth YoY > 15%
+      fa_grossmargin_o25   Gross margin > 25%
+      fa_roe_o10           ROE > 10%
+      sh_price_o5          Price > $5    (no penny trash)
+      sh_avgvol_o500       Avg volume > 500k (liquidity floor)
+      sh_curvol_o1000      Current vol > 1M (today's interest)
+      ta_highlow52w_b10h   Within 10% below 52-week high
+
+    Three blended screens so a single FA miss doesn't kill a candidate.
+    """
+    results = {}
+    screens = [
+        # (filter_string, label, weight)
+        ("fa_epsyoy_o15,fa_grossmargin_o25,sh_price_o5,sh_avgvol_o500,ta_highlow52w_b10h&o=-change",
+            "Growth+Margin near 52wH", 1.6),
+        ("fa_roe_o15,fa_grossmargin_o25,sh_price_o5,sh_avgvol_o500,ta_highlow52w_b10h&o=-change",
+            "ROE+Margin near 52wH",    1.4),
+        ("sh_insiderown_o5,fa_epsyoy_o15,sh_price_o5,sh_avgvol_o500&o=-change",
+            "Insider-own + Growth",    1.5),
+    ]
+
+    session = requests.Session()
+    try:
+        session.get("https://finviz.com/", headers=_finviz_headers(), timeout=8)
+        time.sleep(random.uniform(0.6, 1.2))
+    except Exception:
+        pass
+
+    base_url = "https://finviz.com/screener.ashx?v=111&f={f}&r={r}"
+
+    for f_str, label, weight in screens:
+        page_tickers = []
+        for page in range(3):  # 3 pages × 20 = 60 per screen is plenty
+            row_start = page * 20 + 1
+            url = base_url.format(f=f_str, r=row_start)
+            html = None
+            for attempt in range(3):
+                try:
+                    resp = session.get(url, headers=_finviz_headers(), timeout=12)
+                    if resp.status_code == 200:
+                        html = resp.text
+                        break
+                    elif resp.status_code in (403, 429):
+                        time.sleep(2 ** attempt + random.uniform(1, 2))
+                    else:
+                        break
+                except Exception:
+                    break
+            if html is None:
+                break
+
+            page_result = _finviz_parse_tickers(html)
+            if not page_result:
+                break
+            page_tickers.extend(page_result)
+            time.sleep(random.uniform(1.0, 2.0))
+            if len(page_tickers) >= top_n // len(screens):
+                break
+
+        seen = set()
+        unique = [t for t in page_tickers if not (t in seen or seen.add(t))]
+        for rank, ticker in enumerate(unique):
+            results[ticker] = results.get(ticker, 0) + (len(unique) - rank) * weight
+        if unique:
+            console.print(f"  [green]✔ Finviz Quality [{label}]: {len(unique)} tickers[/green]")
+        else:
+            console.print(f"  [yellow]⚠ Finviz Quality [{label}]: 0 tickers[/yellow]")
+        time.sleep(random.uniform(1.5, 2.5))
+
+    return results
+
+
+# ──────────────────────────────────────────────
 #  UNIVERSE BUILDER
 # ──────────────────────────────────────────────
 
@@ -712,6 +864,16 @@ def build_universe(sources: list, max_tickers: int = 500, show: bool = False) ->
         for t, s in fetch_reddit_mentions().items():
             combined[t] += s * 2.0
 
+    if "insider" in sources:
+        console.print("[cyan]🕵  OpenInsider cluster buys + officer purchases...[/cyan]")
+        for t, s in fetch_openinsider_clusters().items():
+            combined[t] += s * 2.2  # strongest single fundamental signal
+
+    if "quality" in sources:
+        console.print("[cyan]💎 Finviz quality screen (growth + margin + near 52wH)...[/cyan]")
+        for t, s in fetch_finviz_quality().items():
+            combined[t] += s * 1.6
+
     if "nasdaq" in sources or not combined:
         console.print("[cyan]🗄  NASDAQ FTP full list (coverage fallback)...[/cyan]")
         for t, s in fetch_nasdaq_ftp().items():
@@ -739,7 +901,7 @@ def build_universe(sources: list, max_tickers: int = 500, show: bool = False) ->
 #  DATA FETCHER
 # ──────────────────────────────────────────────
 
-def fetch_price_data(tickers: list, period: str = "60d") -> dict:
+def fetch_price_data(tickers: list, period: str = "1y") -> dict:
     data_map   = {}
     batch_size = 30
     batches    = [tickers[i:i+batch_size] for i in range(0, len(tickers), batch_size)]
@@ -820,10 +982,199 @@ def sig_score(sigs):
 
 
 # ──────────────────────────────────────────────
+#  QUALITY SCORING — institutional-flow proxies,
+#  relative strength, breakout-phase tagging
+# ──────────────────────────────────────────────
+
+def rvol50(v):
+    """Relative volume vs trailing 50-day average (excluding today).
+    3x+ = genuine institutional interest; 1.5x = elevated."""
+    if len(v) < 51:
+        return rvol(v)  # fall back to 20d if insufficient history
+    avg = float(v.iloc[-51:-1].mean())
+    return round(float(v.iloc[-1]) / avg, 2) if avg > 0 else 0.0
+
+
+def obv_slope(c, v, lookback=20):
+    """Slope of On-Balance-Volume over `lookback` days, normalized by
+    average daily volume. Positive = accumulation, negative = distribution.
+    Returns value in roughly [-1, +1]."""
+    if len(c) < lookback + 2:
+        return 0.0
+    direction = np.sign(c.diff().fillna(0))
+    obv = (direction * v).cumsum()
+    seg = obv.iloc[-lookback:].values.astype(float)
+    if np.std(seg) == 0:
+        return 0.0
+    x = np.arange(len(seg))
+    slope = float(np.polyfit(x, seg, 1)[0])
+    avg_v = float(v.iloc[-lookback:].mean())
+    if avg_v <= 0:
+        return 0.0
+    return max(-1.5, min(1.5, slope / avg_v))
+
+
+def cmf(h, l, c, v, p=20):
+    """Chaikin Money Flow — closes near highs on volume = accumulation.
+    >0.15 = strong inflow; <-0.10 = strong outflow."""
+    if len(c) < p:
+        return 0.0
+    rng = (h - l).replace(0, np.nan)
+    mfm = ((c - l) - (h - c)) / rng
+    mfv = mfm * v
+    vol_sum = float(v.iloc[-p:].sum())
+    return float(mfv.iloc[-p:].sum() / vol_sum) if vol_sum > 0 else 0.0
+
+
+def rs_vs_benchmark(c, bench_c, periods=(21, 63)):
+    """IBD-style relative strength: stock return minus benchmark return
+    (in %), averaged across the given periods. Positive = outperforming."""
+    if bench_c is None or len(c) < max(periods) + 1 or len(bench_c) < max(periods) + 1:
+        return None
+    scores = []
+    for p in periods:
+        try:
+            s_ret = float(c.iloc[-1]) / float(c.iloc[-p-1]) - 1
+            b_ret = float(bench_c.iloc[-1]) / float(bench_c.iloc[-p-1]) - 1
+            scores.append((s_ret - b_ret) * 100)
+        except Exception:
+            continue
+    return round(sum(scores) / len(scores), 1) if scores else None
+
+
+def weinstein_stage(c):
+    """Stan Weinstein stage classification using the 30-week (150d) SMA.
+    Stage 2 = price above a rising 30w SMA = where the 10-15%/week moves live.
+    Stage 4 = below a falling 30w SMA = avoid."""
+    if len(c) < 150:
+        return "Unknown"
+    sma = c.rolling(150).mean()
+    sma_now = float(sma.iloc[-1])
+    look_back = min(21, len(sma) - 1)
+    sma_ago = float(sma.iloc[-look_back])
+    if np.isnan(sma_now) or np.isnan(sma_ago):
+        return "Unknown"
+    price = float(c.iloc[-1])
+    rising  = sma_now > sma_ago * 1.005
+    falling = sma_now < sma_ago * 0.995
+    above   = price > sma_now
+    if above and rising:    return "Stage2"
+    if above and falling:   return "Stage3"
+    if (not above) and falling: return "Stage4"
+    return "Stage1"
+
+
+def base_tightness(h, l, c, lookback=10):
+    """ATR contraction ratio: current 14d ATR / 14d ATR `lookback` days ago.
+    <0.85 = base is tightening (volatility contraction precedes expansion)."""
+    if len(c) < lookback + 15:
+        return 1.0
+    tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+    atr_ser = tr.rolling(14).mean()
+    atr_now  = float(atr_ser.iloc[-1])
+    atr_then = float(atr_ser.iloc[-lookback])
+    return round(atr_now / atr_then, 2) if atr_then > 0 else 1.0
+
+
+def pivot_distance(c, h, lookback=20):
+    """% above/below the recent `lookback`-day pivot high.
+    ~0 = at the breakout point (best R:R). >5% = extended, late entry."""
+    if len(c) < lookback + 1:
+        return 0.0
+    pivot = float(h.iloc[-lookback-1:-1].max())
+    price = float(c.iloc[-1])
+    return round((price - pivot) / pivot * 100, 1) if pivot > 0 else 0.0
+
+
+def breakout_phase(c, h, l, lookback=20, window=10):
+    """Tag where the stock is in the breakout process.
+    Base        — still under a tight pivot, primed
+    Breakout    — broke pivot in last 1-2 days (best entry)
+    Continuation— 3-5 days post-breakout, holding
+    Extended    — far above pivot, chasing risk
+    Failed      — broke pivot then fell back below"""
+    if len(c) < lookback + window + 1:
+        return "Unknown"
+    pivot_series = h.iloc[-lookback-window-1:-window-1]
+    if len(pivot_series) == 0:
+        return "Unknown"
+    pivot = float(pivot_series.max())
+    if pivot <= 0:
+        return "Unknown"
+    recent = c.iloc[-window:]
+    price = float(c.iloc[-1])
+    above_mask = (recent > pivot).values
+    pct_above = (price - pivot) / pivot * 100
+
+    if not above_mask.any():
+        return "Base" if base_tightness(h, l, c, 10) < 0.88 else "—"
+    if price < pivot * 0.985:
+        return "Failed"
+    first_break = int(np.argmax(above_mask))   # first True index
+    days_since  = (len(above_mask) - 1) - first_break
+    if days_since <= 1:
+        return "Breakout"
+    if days_since <= 5 and pct_above < 10:
+        return "Continuation"
+    return "Extended"
+
+
+def setup_quality_score(df, bench_c, pop=0):
+    """Unified 0-100 quality score for swing setups targeting 10-15% in a week.
+    Combines: RVOL vs 50d, OBV/CMF inflow proxies, RS vs SPY, Weinstein
+    stage, pivot proximity, base tightness, gap-vs-ATR, popularity.
+    Returns (score, phase, meta_dict)."""
+    if df is None or len(df) < 25:
+        return 0, "Unknown", {}
+    c, v, h, l, o = df["Close"], df["Volume"], df["High"], df["Low"], df["Open"]
+    try:
+        price = float(c.iloc[-1])
+        if price <= 0:
+            return 0, "Unknown", {}
+        a   = atr(h, l, c)
+        atp = (a / price) * 100 if price > 0 else 0
+
+        rv50      = rvol50(v)
+        obvs      = obv_slope(c, v, 20)
+        cmf20     = cmf(h, l, c, v, 20)
+        rs        = rs_vs_benchmark(c, bench_c)
+        stage     = weinstein_stage(c)
+        pivot_d   = pivot_distance(c, h, 20)
+        tightness = base_tightness(h, l, c, 10)
+        phase     = breakout_phase(c, h, l, 20, 10)
+        gap_pct   = (float(o.iloc[-1]) - float(c.iloc[-2])) / float(c.iloc[-2]) * 100 if len(c) >= 2 else 0
+        gap_atr   = gap_pct / atp if atp > 0 else 0
+
+        # Each sub-score is 0..10
+        comps = {
+            "RVOL50":   10 if rv50  >= 3.0 else (7 if rv50  >= 2.0 else (4 if rv50  >= 1.3 else 0)),
+            "OBV":      10 if obvs  >  0.5 else (6 if obvs  >  0.0 else 0),
+            "CMF":      10 if cmf20 >  0.15 else (6 if cmf20 > 0.05 else (3 if cmf20 > 0 else 0)),
+            "RS":       (10 if rs >  5 else (7 if rs > 0 else (3 if rs > -5 else 0))) if rs is not None else 5,
+            "Stage":    10 if stage == "Stage2" else (5 if stage == "Stage1" else (2 if stage == "Stage3" else 0)),
+            "Pivot":    10 if -2 <= pivot_d <= 3 else (6 if -5 <= pivot_d < -2 else (2 if pivot_d > 5 else 0)),
+            "Tight":    10 if tightness < 0.80 else (6 if tightness < 0.90 else 0),
+            "GapATR":   10 if gap_atr >= 1.5 else (6 if gap_atr >= 0.8 else (3 if gap_atr > 0 else 0)),
+            "Phase":    10 if phase == "Breakout" else (8 if phase == "Continuation" else (6 if phase == "Base" else (2 if phase == "Extended" else 0))),
+            "Pop":      10 if pop > 100 else (6 if pop > 30 else (2 if pop > 5 else 0)),
+        }
+        raw = sum(comps.values())
+        score = round(raw / (len(comps) * 10) * 100)
+        meta = {
+            "rvol50": rv50, "obv_slope": round(obvs, 3), "cmf": round(cmf20, 3),
+            "rs": rs, "stage": stage, "pivot_dist": pivot_d, "tightness": tightness,
+            "gap_atr": round(gap_atr, 2),
+        }
+        return score, phase, meta
+    except Exception:
+        return 0, "Unknown", {}
+
+
+# ──────────────────────────────────────────────
 #  STRATEGY 1: HIGH RVOL / CATALYST
 # ──────────────────────────────────────────────
 
-def s1_catalyst(data_map, info_map, pop_scores):
+def s1_catalyst(data_map, info_map, pop_scores, bench_c=None):
     results = []
     for ticker, df in data_map.items():
         try:
@@ -866,6 +1217,8 @@ def s1_catalyst(data_map, info_map, pop_scores):
             if conf < 40:
                 continue
 
+            setupq, phase, _meta = setup_quality_score(df, bench_c, pop)
+
             target = round(price * (1 + atp / 100 * 2.2), 2)
             stop   = round(price * (1 - atp / 100 * 0.9), 2)
             rr     = round((target - price) / (price - stop), 2) if price > stop else 0
@@ -878,10 +1231,11 @@ def s1_catalyst(data_map, info_map, pop_scores):
                 Ticker=ticker, Price=f"${price:.2f}", RVOL=f"{rv}x",
                 DayChg=f"{day_chg:+.1f}%", RSI=round(r, 1),
                 ATR_pct=f"{atp:.1f}%", Cap=cap_lbl,
+                Phase=phase, SetupQ=setupq,
                 Breakout="✅" if near_brk else "—",
                 PopScore=round(pop), Target=f"${target}",
                 Stop=f"${stop}", RR=f"1:{rr}",
-                Confidence=conf, _score=conf,
+                Confidence=conf, _score=(conf + setupq) / 2,
             ))
         except Exception:
             continue
@@ -895,7 +1249,7 @@ def s1_catalyst(data_map, info_map, pop_scores):
 #  STRATEGY 2: MOMENTUM SWING
 # ──────────────────────────────────────────────
 
-def s2_swing(data_map, info_map, pop_scores):
+def s2_swing(data_map, info_map, pop_scores, bench_c=None):
     results = []
     for ticker, df in data_map.items():
         try:
@@ -946,6 +1300,8 @@ def s2_swing(data_map, info_map, pop_scores):
             if conf < 45:
                 continue
 
+            setupq, phase, _meta = setup_quality_score(df, bench_c, pop)
+
             tgt_pct = max(15, min(35, m1m * 1.5 + 10))
             target  = round(price * (1 + tgt_pct / 100), 2)
             stop    = round(max(e50, price * 0.90), 2)
@@ -958,10 +1314,11 @@ def s2_swing(data_map, info_map, pop_scores):
                 Mom1M=f"{m1m:+.1f}%", Mom3M=f"{m3m:+.1f}%",
                 UpDnVol=f"{uvr}x",
                 HH_HL="✅" if (hh and hl) else ("⚠️" if (hh or hl) else "❌"),
+                Phase=phase, SetupQ=setupq,
                 PopScore=round(pop),
                 Target=f"${target}(+{tgt_pct:.0f}%)",
                 Stop=f"${stop}", Timeframe=tf,
-                Confidence=conf, _score=conf,
+                Confidence=conf, _score=(conf + setupq) / 2,
             ))
         except Exception:
             continue
@@ -975,7 +1332,7 @@ def s2_swing(data_map, info_map, pop_scores):
 #  STRATEGY 3: GAP & BREAKOUT
 # ──────────────────────────────────────────────
 
-def s3_breakout(data_map, info_map, pop_scores):
+def s3_breakout(data_map, info_map, pop_scores, bench_c=None):
     results = []
     for ticker, df in data_map.items():
         try:
@@ -1021,6 +1378,8 @@ def s3_breakout(data_map, info_map, pop_scores):
             if conf < 42:
                 continue
 
+            setupq, phase, _meta = setup_quality_score(df, bench_c, pop)
+
             tgt_pct = gap_pct * 1.5 + 5
             target  = round(price * (1 + tgt_pct / 100), 2)
             stop    = round(price * 0.94, 2)
@@ -1036,10 +1395,11 @@ def s3_breakout(data_map, info_map, pop_scores):
                 RSI=round(r, 1), DayChg=f"{day_chg:+.1f}%",
                 FlatBase="✅" if flat else "—",
                 H52Break="✅" if price >= h52*0.97 else "—",
+                Phase=phase, SetupQ=setupq,
                 Cap=cap_lbl, PopScore=round(pop),
                 Target=f"${target}(+{tgt_pct:.0f}%)",
                 Stop=f"${stop}", RR=f"1:{rr}",
-                Confidence=conf, _score=conf,
+                Confidence=conf, _score=(conf + setupq) / 2,
             ))
         except Exception:
             continue
@@ -1358,7 +1718,7 @@ def s6_sector_rotation(data_map, info_map, pop_scores):
 #  STRATEGY 7: OPENING RANGE BREAKOUT (ORB)
 # ──────────────────────────────────────────────
 
-def s7_orb(data_map, info_map, pop_scores):
+def s7_orb(data_map, info_map, pop_scores, bench_c=None):
     results = []
     for ticker, df in data_map.items():
         try:
@@ -1415,6 +1775,9 @@ def s7_orb(data_map, info_map, pop_scores):
             if conf < 45:
                 continue
 
+            pop = pop_scores.get(ticker, 0)
+            setupq, phase, _meta = setup_quality_score(df, bench_c, pop)
+
             orb_size = today_h - today_l
             target   = round(today_h + orb_size, 2)
             target2  = round(today_h + orb_size * 1.5, 2)
@@ -1427,10 +1790,11 @@ def s7_orb(data_map, info_map, pop_scores):
                 PosInRange=f"{pos_in_range*100:.0f}%", RVOL=f"{rv}x",
                 VolVsYday=f"{vol_vs_yday:.1f}x", RSI=round(r, 1), Cap=cap_lbl,
                 OrbBreak="✅" if orb_break else "—",
+                Phase=phase, SetupQ=setupq,
                 Target1=f"${target}", Target2=f"${target2}",
                 Stop=f"${stop}", RR=f"1:{rr}",
-                PopScore=round(pop_scores.get(ticker, 0)),
-                Confidence=conf, _score=conf,
+                PopScore=round(pop),
+                Confidence=conf, _score=(conf + setupq) / 2,
             ))
         except Exception:
             continue
@@ -1457,6 +1821,7 @@ def display(title, subtitle, rows, color):
         "Confidence": 11, "vsEMA20": 9, "vsEMA50": 9, "Mom1M": 8,
         "Mom3M": 8, "UpDnVol": 9, "HH_HL": 7, "Timeframe": 10,
         "Gap": 7, "FlatBase": 9, "H52Break": 10,
+        "Phase": 13, "SetupQ": 8,
     }
     t = Table(box=box.SIMPLE_HEAVY, header_style=f"bold {color}",
               show_lines=True, expand=True)
@@ -1523,8 +1888,8 @@ def main():
     ap.add_argument("--morning",       action="store_true")
     ap.add_argument("--ten-am",        action="store_true")
     ap.add_argument("--sources",       nargs="+",
-                    default=["finviz", "yahoo", "reddit"],
-                    choices=["finviz", "yahoo", "reddit", "nasdaq"])
+                    default=["finviz", "yahoo", "reddit", "insider", "quality"],
+                    choices=["finviz", "yahoo", "reddit", "nasdaq", "insider", "quality"])
     ap.add_argument("--max",           type=int, default=400)
     ap.add_argument("--export",        action="store_true")
     ap.add_argument("--show-universe", action="store_true")
@@ -1532,7 +1897,7 @@ def main():
 
     console.print(Panel.fit(
         "[bold white]NASDAQ POPULARITY SCREENER  v4.0[/bold white]\n"
-        "[dim]Finviz + Yahoo + StockTwits + Reddit → popularity-ranked universe → 7 strategies[/dim]\n"
+        "[dim]Finviz + Yahoo + StockTwits + Reddit + OpenInsider + Quality → ranked universe → 7 strategies[/dim]\n"
         "[dim]Strategies 1–3: Premarket/Open  |  4–6: Overnight Prep  |  7: 10 AM ORB[/dim]",
         border_style="bright_blue", padding=(1, 4)))
     timing_banner()
@@ -1556,28 +1921,39 @@ def main():
 
     data_map = fetch_price_data(tickers)
     info_map = fetch_fundamentals(list(data_map.keys()))
+
+    # SPY benchmark for relative-strength scoring
+    bench_c = None
+    try:
+        bench_df = yf.download("SPY", period="1y", interval="1d",
+                               auto_adjust=True, progress=False)
+        if bench_df is not None and len(bench_df) > 60:
+            bench_c = bench_df["Close"]
+            console.print(f"[green]✔ Benchmark: SPY ({len(bench_c)} bars) loaded for RS scoring[/green]")
+    except Exception as e:
+        console.print(f"[yellow]⚠ SPY benchmark failed: {e} — RS score will be neutral[/yellow]")
     console.print()
 
     exports = {}
 
     if 1 in run:
-        r1 = s1_catalyst(data_map, info_map, pop_scores)
+        r1 = s1_catalyst(data_map, info_map, pop_scores, bench_c=bench_c)
         display("STRATEGY 1 — CATALYST / HIGH RVOL",
-                "Price <$10 | RVOL >2x | Explosive intraday | Best: Premarket 6–9:30 AM",
+                "Price <$10 | RVOL >2x | Explosive intraday | SetupQ blends RVOL50/OBV/CMF/RS/Stage/Phase",
                 r1, "red")
         exports["s1_catalyst"] = r1
 
     if 2 in run:
-        r2 = s2_swing(data_map, info_map, pop_scores)
+        r2 = s2_swing(data_map, info_map, pop_scores, bench_c=bench_c)
         display("STRATEGY 2 — MOMENTUM SWING",
-                "EMA stacked | RSI 50–68 | HH+HL | Target 15–35% over weeks",
+                "EMA stacked | RSI 50–68 | HH+HL | SetupQ favors Stage2 + RS leaders + accumulation",
                 r2, "green")
         exports["s2_swing"] = r2
 
     if 3 in run:
-        r3 = s3_breakout(data_map, info_map, pop_scores)
+        r3 = s3_breakout(data_map, info_map, pop_scores, bench_c=bench_c)
         display("STRATEGY 3 — GAP & BREAKOUT",
-                "Gap up | Flat base break | Volume confirm | Best: Market Open",
+                "Gap up | Flat base break | Volume confirm | Phase tag flags Base/Breakout/Continuation/Extended",
                 r3, "yellow")
         exports["s3_breakout"] = r3
 
@@ -1609,7 +1985,7 @@ def main():
             exports["s6_sector_stocks"] = r6
 
     if 7 in run:
-        r7 = s7_orb(data_map, info_map, pop_scores)
+        r7 = s7_orb(data_map, info_map, pop_scores, bench_c=bench_c)
         display("STRATEGY 7 — OPENING RANGE BREAKOUT (10 AM)",
                 "Gap held | Above open | Volume surging | First 30-min high broken | Run: 10 AM",
                 r7, "bright_cyan")
@@ -1643,3 +2019,27 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+'''
+Plan:
+
+what are better ways to identify momentum setups before and after the market? Looking the day before or at nighttime to see
+what options will usually be the best to ride typically to 10-15 percent in a week.
+    - Also, can we check the inflow/outflow to of a stock to see if there is a lot of institutional interest building up that could be a catalyst for a big move?
+       or just look at volume pattterns, tachnicals and so forth to proprly build something that can identify good swing trading.
+       On top of this, for premarket movers I would like to utilize the volume flow, chart trend, candle patterns, key points broken and so forth
+       to look at more than just high relative volume to determine the quality of pop, as well as identifiying where we are in the breakout process
+
+
+What are ways to get better stocks that I can utilize for swing trading, additionally, I have a free paper trading account on alpaca, is it possible
+to switch to that for better data and execution?
+
+
+Where can I get more stocks that are good quality yet volitile safely enough for sqing trading? I am using stocktwits as of now but wnat to see
+where else we can get quality with fundamentals yet innovative enough to have good swings. I want to be able to find stocks that have good fundamentals but are 
+also good enough to swing trade, ideally with some catalyst or momentum behind them in the early stages prior to when moved heavily up. I also want to be able to identify 
+when a stock is in a good position to swing trade, such as being near a key support or resistance level, or having a strong trend.
+
+Where could I get those?
+'''
