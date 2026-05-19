@@ -16,10 +16,22 @@
 ║  All sources are deduplicated + scored by POPULARITY RANK,           ║
 ║  then fed into the 7 strategy screeners.                             ║
 ║                                                                      ║
+║  Price Data: Alpaca (paper trading) → yfinance fallback              ║
 ║  Install:                                                            ║
 ║    pip install yfinance pandas numpy requests rich pytz              ║
-║               beautifulsoup4 lxml praw vaderSentiment               ║
+║               beautifulsoup4 lxml praw vaderSentiment                ║
+║               alpaca-py                                              ║
 ╚══════════════════════════════════════════════════════════════════════╝
+
+ALPACA SETUP (optional, free paper trading):
+  For daily bars from Alpaca instead of yfinance (faster, more reliable):
+  1. Go to https://alpaca.markets and sign up for a paper trading account
+  2. Go to https://app.alpaca.markets/brokerage/account/api
+  3. Copy your API Key and Secret Key
+  4. Set environment variables:
+       export ALPACA_API_KEY="your_key_here"
+       export ALPACA_SECRET_KEY="your_secret_here"
+  Note: Paper trading key auto-routes to paper-api.alpaca.markets
 
 REDDIT SETUP (one-time, free):
   1. Go to https://www.reddit.com/prefs/apps
@@ -53,11 +65,24 @@ import warnings
 from collections import defaultdict
 from datetime import datetime, timedelta
 
+from dotenv import load_dotenv
+
 import numpy as np
 import pandas as pd
 import pytz
 import requests
 import yfinance as yf
+
+load_dotenv()
+
+try:
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame
+    ALPACA_AVAILABLE = True
+except ImportError:
+    ALPACA_AVAILABLE = False
+
 from rich import box
 from rich.console import Console
 from rich.panel import Panel
@@ -821,6 +846,80 @@ def fetch_finviz_quality(top_n: int = 200) -> dict:
     return results
 
 
+def fetch_finviz_momentum(top_n: int = 200) -> dict:
+    """
+    Pull a low-priced, high-volume momentum/breakout screen from Finviz.
+
+    Exact filter URL the user provided:
+      cap_midunder       Mid cap and under
+      exch_nasd          NASDAQ-listed
+      sh_avgvol_o400     Avg volume > 400k
+      sh_curvol_o750     Current volume > 750k (today's interest)
+      sh_float_u100      Float < 100M (room to run)
+      sh_price_u15       Price < $15
+      sh_relvol_o1.5     Relative volume > 1.5x
+      ta_perf_dup        Performance: day up
+      ta_rsi_nos50       RSI(14) not above 50 (not overbought)
+      ta_sma20_pa        Price above SMA20
+      ta_volatility_wo3  Weekly volatility > 3%
+
+    Designed for swing trading targeting 10-15% weekly moves.
+    """
+    results = {}
+    f_str = ("cap_midunder,exch_nasd,sh_avgvol_o400,sh_curvol_o750,"
+             "sh_float_u100,sh_price_u15,sh_relvol_o1.5,ta_perf_dup,"
+             "ta_rsi_nos50,ta_sma20_pa,ta_volatility_wo3")
+
+    session = requests.Session()
+    try:
+        session.get("https://finviz.com/", headers=_finviz_headers(), timeout=8)
+        time.sleep(random.uniform(0.6, 1.2))
+    except Exception:
+        pass
+
+    base_url = "https://finviz.com/screener.ashx?v=111&f={f}&r={r}"
+    all_tickers = []
+
+    for page in range(5):  # up to 5 pages * 20 = 100 tickers
+        row_start = page * 20 + 1
+        url = base_url.format(f=f_str, r=row_start)
+        html = None
+        for attempt in range(3):
+            try:
+                resp = session.get(url, headers=_finviz_headers(), timeout=12)
+                if resp.status_code == 200:
+                    html = resp.text
+                    break
+                elif resp.status_code in (403, 429):
+                    time.sleep(2 ** attempt + random.uniform(1, 2))
+                else:
+                    break
+            except Exception:
+                break
+        if html is None:
+            break
+
+        page_result = _finviz_parse_tickers(html)
+        if not page_result:
+            break
+        all_tickers.extend(page_result)
+        time.sleep(random.uniform(1.0, 2.0))
+        if len(all_tickers) >= top_n:
+            break
+
+    seen = set()
+    unique = [t for t in all_tickers if not (t in seen or seen.add(t))]
+    for rank, ticker in enumerate(unique):
+        results[ticker] = (len(unique) - rank)
+
+    if unique:
+        console.print(f"  [green]✔ Finviz Momentum [low-float breakout]: {len(unique)} tickers[/green]")
+    else:
+        console.print(f"  [yellow]⚠ Finviz Momentum [low-float breakout]: 0 tickers[/yellow]")
+
+    return results
+
+
 # ──────────────────────────────────────────────
 #  UNIVERSE BUILDER
 # ──────────────────────────────────────────────
@@ -874,6 +973,11 @@ def build_universe(sources: list, max_tickers: int = 500, show: bool = False) ->
         for t, s in fetch_finviz_quality().items():
             combined[t] += s * 1.6
 
+    if "momentum" in sources:
+        console.print("[cyan]🚀 Finviz momentum (low-float NASDAQ, relvol>1.5, vol>3%w)...[/cyan]")
+        for t, s in fetch_finviz_momentum().items():
+            combined[t] += s * 2.0  # high-conviction setup screen for 10-15% swings
+
     if "nasdaq" in sources or not combined:
         console.print("[cyan]🗄  NASDAQ FTP full list (coverage fallback)...[/cyan]")
         for t, s in fetch_nasdaq_ftp().items():
@@ -898,17 +1002,167 @@ def build_universe(sources: list, max_tickers: int = 500, show: bool = False) ->
 
 
 # ──────────────────────────────────────────────
+#  ALPACA DATA FETCHER (Paper Trading API)
+# ──────────────────────────────────────────────
+
+def fetch_alpaca_daily(tickers: list, days_back: int = 252) -> dict:
+    """
+    Fetch daily OHLCV bars from Alpaca's StockHistoricalDataClient.
+    Requests in batches and skips invalid symbols gracefully.
+
+    Credentials via environment variables (secure):
+      export ALPACA_API_KEY="your_key"
+      export ALPACA_SECRET_KEY="your_secret"
+
+    Returns:
+      {ticker: DataFrame} with OHLCV columns (compatible with yfinance format)
+    """
+    console.print(f"[dim][DEBUG] ALPACA_AVAILABLE={ALPACA_AVAILABLE}[/dim]")
+    if not ALPACA_AVAILABLE:
+        console.print("[dim][DEBUG] Alpaca not available (import failed)[/dim]")
+        return {}
+
+    api_key = os.environ.get("ALPACA_API_KEY")
+    secret_key = os.environ.get("ALPACA_SECRET_KEY")
+
+    console.print(f"[dim][DEBUG] API Key set: {bool(api_key)}, Secret set: {bool(secret_key)}[/dim]")
+
+    if not api_key or not secret_key:
+        console.print(
+            "[yellow]⚠ ALPACA_API_KEY / ALPACA_SECRET_KEY not in environment — using yfinance[/yellow]\n"
+            "[dim]To use Alpaca: export ALPACA_API_KEY=... && export ALPACA_SECRET_KEY=...[/dim]\n"
+        )
+        return {}
+
+    data_map = {}
+    try:
+        console.print(f"[dim][DEBUG] Creating Alpaca client...[/dim]")
+        client = StockHistoricalDataClient(api_key, secret_key)
+        console.print(f"[dim][DEBUG] Client created successfully[/dim]")
+
+        end_date = datetime.now().date()
+        start_date = end_date - timedelta(days=days_back)
+        console.print(f"[dim][DEBUG] Requesting {len(tickers)} tickers for {start_date} to {end_date}[/dim]")
+
+        def fetch_batch(batch_tickers):
+            """Try to fetch a batch of tickers. If it fails due to invalid symbol, split and retry."""
+            if not batch_tickers:
+                return {}
+
+            try:
+                request = StockBarsRequest(
+                    symbol_or_symbols=batch_tickers,
+                    timeframe=TimeFrame.Day,
+                    start=start_date,
+                    end=end_date,
+                )
+                bars = client.get_stock_bars(request)
+
+                result = {}
+
+                # Use bars.data (dict[ticker -> list of Bar objects]) like alpacacount.py does
+                if hasattr(bars, 'data') and bars.data is not None:
+                    data_source = bars.data
+                    console.print(f"[dim][DEBUG] Using bars.data with {len(data_source)} tickers[/dim]")
+
+                    for ticker in batch_tickers:
+                        if ticker in data_source:
+                            ticker_data = data_source[ticker]
+                            # Convert list of Bar objects to DataFrame
+                            try:
+                                df = pd.DataFrame([{
+                                    "timestamp": bar.timestamp,
+                                    "open": bar.open,
+                                    "high": bar.high,
+                                    "low": bar.low,
+                                    "close": bar.close,
+                                    "volume": bar.volume
+                                } for bar in ticker_data])
+
+                                df.set_index("timestamp", inplace=True)
+                                if len(df) >= 15:
+                                    df = df[["open", "high", "low", "close", "volume"]].copy()
+                                    df.columns = [c.title() for c in df.columns]
+                                    df = df.dropna()
+                                    if len(df) >= 15:
+                                        result[ticker] = df
+                            except Exception as e:
+                                console.print(f"[dim][DEBUG] Failed to process {ticker}: {e}[/dim]")
+                                continue
+
+                return result
+            except Exception as e:
+                error_msg = str(e)
+                if "invalid symbol" in error_msg.lower() and len(batch_tickers) > 1:
+                    console.print(f"[yellow]Invalid symbol in batch of {len(batch_tickers)}, splitting...[/yellow]")
+                    mid = len(batch_tickers) // 2
+                    result = {}
+                    result.update(fetch_batch(batch_tickers[:mid]))
+                    result.update(fetch_batch(batch_tickers[mid:]))
+                    return result
+                else:
+                    console.print(f"[dim]Batch failed ({len(batch_tickers)} tickers): {error_msg}[/dim]")
+                    return {}
+
+        batch_size = 100
+        batches = [tickers[i:i+batch_size] for i in range(0, len(tickers), batch_size)]
+
+        # DEBUG: Check what we got back from a test batch
+        if batches:
+            test_batch = batches[0][:5] if len(batches[0]) > 5 else batches[0]
+            console.print(f"[dim][DEBUG] Testing first batch with {len(test_batch)} tickers: {test_batch}[/dim]")
+
+        for batch in batches:
+            batch_result = fetch_batch(batch)
+            data_map.update(batch_result)
+
+        if data_map:
+            console.print(f"[green]✔ Alpaca: {len(data_map)}/{len(tickers)} tickers loaded[/green]")
+        else:
+            console.print(f"[yellow][DEBUG] Alpaca returned 0 tickers[/yellow]")
+        return data_map
+
+    except Exception as e:
+        console.print(f"[yellow]⚠ Alpaca fetch failed: {e}[/yellow]")
+        return {}
+
+
+# ──────────────────────────────────────────────
 #  DATA FETCHER
 # ──────────────────────────────────────────────
 
-def fetch_price_data(tickers: list, period: str = "1y") -> dict:
-    data_map   = {}
+def fetch_price_data(tickers: list, period: str = "1y", skip_alpaca: bool = False) -> dict:
+    console.print(f"[dim][DEBUG] fetch_price_data: starting with {len(tickers)} tickers[/dim]")
+    # Try Alpaca first (if credentials available and not overridden)
+    alpaca_map = {} if skip_alpaca else fetch_alpaca_daily(tickers, days_back=252)
+    if skip_alpaca:
+        console.print(f"[dim][DEBUG] Alpaca skipped (--override_alpaca)[/dim]")
+    else:
+        console.print(f"[dim][DEBUG] Alpaca returned {len(alpaca_map)} tickers[/dim]")
+
+    if alpaca_map:
+        # Alpaca succeeded for some; use it and only yfinance for missing
+        missing = [t for t in tickers if t not in alpaca_map]
+        console.print(f"[dim][DEBUG] Missing from Alpaca: {len(missing)} tickers[/dim]")
+        if not missing:
+            console.print(f"[green]✔ Price data: {len(alpaca_map):,} tickers loaded (Alpaca)[/green]")
+            return alpaca_map
+        # Fall through: fetch missing via yfinance
+        tickers_to_fetch = missing
+    else:
+        # Alpaca not available; fetch all from yfinance
+        console.print(f"[dim][DEBUG] Alpaca returned empty, fetching all {len(tickers)} from yfinance[/dim]")
+        tickers_to_fetch = tickers
+
+    # Fetch from yfinance (full set or missing set)
+    data_map = alpaca_map.copy() if alpaca_map else {}
     batch_size = 30
-    batches    = [tickers[i:i+batch_size] for i in range(0, len(tickers), batch_size)]
+    batches = [tickers_to_fetch[i:i+batch_size] for i in range(0, len(tickers_to_fetch), batch_size)]
 
     with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
                   BarColumn(), TaskProgressColumn(), console=console) as prog:
-        task = prog.add_task(f"[cyan]Downloading {len(tickers)} tickers...", total=len(batches))
+        task = prog.add_task(f"[cyan]Downloading {len(tickers_to_fetch)} tickers (yfinance)...",
+                             total=len(batches))
         for batch in batches:
             try:
                 raw = yf.download(batch, period=period, interval="1d",
@@ -928,7 +1182,8 @@ def fetch_price_data(tickers: list, period: str = "1y") -> dict:
             prog.advance(task)
             time.sleep(0.2)
 
-    console.print(f"[green]✔ Price data: {len(data_map):,} tickers loaded[/green]")
+    source = "Alpaca+yfinance" if alpaca_map else "yfinance"
+    console.print(f"[green]✔ Price data: {len(data_map):,} tickers loaded ({source})[/green]")
     return data_map
 
 
@@ -962,6 +1217,99 @@ def rsi(c, p=14):
     g = d.clip(lower=0).rolling(p).mean()
     l = (-d.clip(upper=0)).rolling(p).mean()
     return float((100 - 100 / (1 + g / (l + 1e-9))).iloc[-1])
+
+def rsi_series(c, p=14):
+    d = c.diff()
+    g = d.clip(lower=0).rolling(p).mean()
+    l = (-d.clip(upper=0)).rolling(p).mean()
+    return 100 - 100 / (1 + g / (l + 1e-9))
+
+def rsi_inflection(rsi_ser, lookback=10):
+    """Detect that RSI bottomed N days ago and is now climbing.
+    Returns (days_since_bottom, rsi_at_bottom, rsi_now_minus_bottom)."""
+    if rsi_ser is None or len(rsi_ser) < lookback + 1:
+        return None, None, None
+    window = rsi_ser.iloc[-lookback:].dropna()
+    if window.empty:
+        return None, None, None
+    min_pos = int(window.values.argmin())
+    days_ago = len(window) - 1 - min_pos
+    rsi_min = float(window.iloc[min_pos])
+    rsi_now = float(window.iloc[-1])
+    return days_ago, rsi_min, rsi_now - rsi_min
+
+def bullish_rsi_divergence(c, rsi_ser, lookback=15):
+    """Price made a lower low, RSI made a higher low — classic exhaustion signal."""
+    if len(c) < lookback + 1 or rsi_ser is None or len(rsi_ser) < lookback + 1:
+        return False
+    p = c.iloc[-lookback:].values.astype(float)
+    r = rsi_ser.iloc[-lookback:].values.astype(float)
+    mid = lookback // 2
+    p1 = int(np.argmin(p[:mid]))
+    p2 = mid + int(np.argmin(p[mid:]))
+    if p2 <= p1 or not (p[p2] < p[p1]):
+        return False
+    if np.isnan(r[p1]) or np.isnan(r[p2]):
+        return False
+    return r[p2] > r[p1] + 2  # need a meaningful gap, not noise
+
+def macd_histogram_turning_up(c):
+    """MACD histogram rising for the last 3 bars (still negative is OK)."""
+    if len(c) < 35:
+        return False
+    ema12 = c.ewm(span=12, adjust=False).mean()
+    ema26 = c.ewm(span=26, adjust=False).mean()
+    macd  = ema12 - ema26
+    sig   = macd.ewm(span=9, adjust=False).mean()
+    h     = (macd - sig).values
+    if len(h) < 4 or np.isnan(h[-3]):
+        return False
+    return bool(h[-1] > h[-2] > h[-3])
+
+def ema_reclaim(c, span=10, min_below_days=5):
+    """Stock was below EMA(span) for most of the prior `min_below_days` and
+    just closed back above it — trend shift from down to up."""
+    if len(c) < span * 3:
+        return False
+    e = c.ewm(span=span, adjust=False).mean()
+    if float(c.iloc[-1]) <= float(e.iloc[-1]):
+        return False
+    prior_c = c.iloc[-(min_below_days+1):-1]
+    prior_e = e.iloc[-(min_below_days+1):-1]
+    below = (prior_c < prior_e).sum()
+    return int(below) >= min_below_days - 1
+
+def higher_low_structure(l_ser, lookback=15):
+    """Most recent swing low > prior swing low — base is firming."""
+    if len(l_ser) < lookback:
+        return False
+    ll = l_ser.iloc[-lookback:].values.astype(float)
+    mid = lookback // 2
+    return float(np.min(ll[mid:])) > float(np.min(ll[:mid]))
+
+def up_vol_expansion(c, v, lookback=10):
+    """Avg volume on green days > 1.3× avg volume on red days within window."""
+    if len(c) < lookback + 1:
+        return False
+    d = c.diff().iloc[-lookback:]
+    vols = v.iloc[-lookback:]
+    up = vols[d > 0]
+    dn = vols[d < 0]
+    if len(up) == 0 or len(dn) == 0:
+        return False
+    return float(up.mean()) > float(dn.mean()) * 1.3
+
+def closes_upper_half(h, l, c, days=2):
+    """Last N sessions closed in the upper half of their daily range — buyers won."""
+    if len(c) < days:
+        return False
+    for i in range(-days, 0):
+        rng = float(h.iloc[i]) - float(l.iloc[i])
+        if rng <= 0:
+            return False
+        if (float(c.iloc[i]) - float(l.iloc[i])) / rng < 0.5:
+            return False
+    return True
 
 def atr(h, l, c, p=14):
     tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
@@ -1171,6 +1519,28 @@ def setup_quality_score(df, bench_c, pop=0):
 
 
 # ──────────────────────────────────────────────
+#  COUNTRY FILTER
+# ──────────────────────────────────────────────
+
+_CHINA_MARKERS  = {"china", "hong kong", "cayman islands", "british virgin islands"}
+_ISRAEL_MARKERS = {"israel"}
+
+def _company_country(ticker: str, info_map: dict) -> str:
+    """Return lowercase country string from yfinance info, or empty string."""
+    info = info_map.get(ticker, {})
+    return str(info.get("country", "") or "").lower().strip()
+
+def _is_blocked(ticker: str, info_map: dict, strategy: int) -> bool:
+    """Return True if this ticker should be excluded for this strategy."""
+    country = _company_country(ticker, info_map)
+    if any(m in country for m in _ISRAEL_MARKERS):
+        return True
+    if strategy == 1 and any(m in country for m in _CHINA_MARKERS):
+        return True
+    return False
+
+
+# ──────────────────────────────────────────────
 #  STRATEGY 1: HIGH RVOL / CATALYST
 # ──────────────────────────────────────────────
 
@@ -1178,6 +1548,8 @@ def s1_catalyst(data_map, info_map, pop_scores, bench_c=None):
     results = []
     for ticker, df in data_map.items():
         try:
+            if _is_blocked(ticker, info_map, 1):
+                continue
             if len(df) < 20:
                 continue
             c, v, h, l, o = df["Close"], df["Volume"], df["High"], df["Low"], df["Open"]
@@ -1226,6 +1598,8 @@ def s1_catalyst(data_map, info_map, pop_scores, bench_c=None):
             info   = info_map.get(ticker, {})
             cap    = info.get("marketCap", 0)
             cap_lbl= "Micro" if cap < 300e6 else ("Small" if cap < 2e9 else "Mid")
+            industry = info.get("industry", "—")
+            country = info.get("country", "—")
 
             results.append(dict(
                 Ticker=ticker, Price=f"${price:.2f}", RVOL=f"{rv}x",
@@ -1235,7 +1609,8 @@ def s1_catalyst(data_map, info_map, pop_scores, bench_c=None):
                 Breakout="✅" if near_brk else "—",
                 PopScore=round(pop), Target=f"${target}",
                 Stop=f"${stop}", RR=f"1:{rr}",
-                Confidence=conf, _score=(conf + setupq) / 2,
+                Confidence=conf, Industry=industry, Country=country,
+                _score=(conf + setupq) / 2,
             ))
         except Exception:
             continue
@@ -1253,6 +1628,8 @@ def s2_swing(data_map, info_map, pop_scores, bench_c=None):
     results = []
     for ticker, df in data_map.items():
         try:
+            if _is_blocked(ticker, info_map, 2):
+                continue
             if len(df) < 55:
                 continue
             c, v, h, l = df["Close"], df["Volume"], df["High"], df["Low"]
@@ -1278,6 +1655,8 @@ def s2_swing(data_map, info_map, pop_scores, bench_c=None):
             info    = info_map.get(ticker, {})
             rev_g   = info.get("revenueGrowth", None)
             fwd_eps = info.get("forwardEps", None)
+            industry = info.get("industry", "—")
+            country = info.get("country", "—")
 
             sigs = {
                 "above_e20":  1.0 if price > e20 else 0.0,
@@ -1318,7 +1697,8 @@ def s2_swing(data_map, info_map, pop_scores, bench_c=None):
                 PopScore=round(pop),
                 Target=f"${target}(+{tgt_pct:.0f}%)",
                 Stop=f"${stop}", Timeframe=tf,
-                Confidence=conf, _score=(conf + setupq) / 2,
+                Confidence=conf, Industry=industry, Country=country,
+                _score=(conf + setupq) / 2,
             ))
         except Exception:
             continue
@@ -1336,6 +1716,8 @@ def s3_breakout(data_map, info_map, pop_scores, bench_c=None):
     results = []
     for ticker, df in data_map.items():
         try:
+            if _is_blocked(ticker, info_map, 3):
+                continue
             if len(df) < 30:
                 continue
             c, v, h, l, o = df["Close"], df["Volume"], df["High"], df["Low"], df["Open"]
@@ -1388,6 +1770,8 @@ def s3_breakout(data_map, info_map, pop_scores, bench_c=None):
             info    = info_map.get(ticker, {})
             cap     = info.get("marketCap", 0)
             cap_lbl = "Micro" if cap < 300e6 else ("Small" if cap < 2e9 else ("Mid" if cap < 10e9 else "Large"))
+            industry = info.get("industry", "—")
+            country = info.get("country", "—")
 
             results.append(dict(
                 Ticker=ticker, Price=f"${price:.2f}",
@@ -1399,7 +1783,8 @@ def s3_breakout(data_map, info_map, pop_scores, bench_c=None):
                 Cap=cap_lbl, PopScore=round(pop),
                 Target=f"${target}(+{tgt_pct:.0f}%)",
                 Stop=f"${stop}", RR=f"1:{rr}",
-                Confidence=conf, _score=(conf + setupq) / 2,
+                Confidence=conf, Industry=industry, Country=country,
+                _score=(conf + setupq) / 2,
             ))
         except Exception:
             continue
@@ -1417,6 +1802,8 @@ def s4_earnings_setup(data_map, info_map, pop_scores):
     results = []
     for ticker, df in data_map.items():
         try:
+            if _is_blocked(ticker, info_map, 4):
+                continue
             if len(df) < 20:
                 continue
             c, v, h, l = df["Close"], df["Volume"], df["High"], df["Low"]
@@ -1483,6 +1870,8 @@ def s4_earnings_setup(data_map, info_map, pop_scores):
             exp_move = round(atp * 2.5, 1)
             target   = round(price * (1 + exp_move / 100), 2)
             stop     = round(price * (1 - atp / 100 * 1.2), 2)
+            industry = info.get("industry", "—")
+            country = info.get("country", "—")
 
             results.append(dict(
                 Ticker=ticker, Price=f"${price:.2f}", EarnIn=f"{days_to}d",
@@ -1490,7 +1879,8 @@ def s4_earnings_setup(data_map, info_map, pop_scores):
                 Range5D=f"{range_5d:.1f}%", RVOL=f"{rv}x",
                 ExpMove=f"±{exp_move}%", Target=f"${target}", Stop=f"${stop}",
                 PopScore=round(pop_scores.get(ticker, 0)),
-                Confidence=conf, _score=conf,
+                Confidence=conf, Industry=industry, Country=country,
+                _score=conf,
             ))
         except Exception:
             continue
@@ -1508,20 +1898,25 @@ def s5_oversold_reversal(data_map, info_map, pop_scores):
     results = []
     for ticker, df in data_map.items():
         try:
-            if len(df) < 30:
+            if _is_blocked(ticker, info_map, 5):
+                continue
+            if len(df) < 40:
                 continue
             c, v, h, l, o = df["Close"], df["Volume"], df["High"], df["Low"], df["Open"]
             price = float(c.iloc[-1])
             if price < 2:
                 continue
 
-            r = rsi(c)
-            if r > 35:
+            # — was it oversold? (gate: currently OR within last 10 days)
+            r_ser = rsi_series(c)
+            r = float(r_ser.iloc[-1])
+            rsi_min_10d = float(r_ser.iloc[-10:].min()) if len(r_ser) >= 10 else r
+            if not (r < 40 or rsi_min_10d < 32):
                 continue
 
             a    = atr(h, l, c)
             atp  = (a / price) * 100
-            rv   = rvol(v)
+            e20  = float(ema(c, 20).iloc[-1])
             e50  = float(ema(c, 50).iloc[-1])
             e200 = float(ema(c, 200).iloc[-1]) if len(c) >= 200 else None
 
@@ -1540,43 +1935,87 @@ def s5_oversold_reversal(data_map, info_map, pop_scores):
             l52       = float(l.rolling(252).min().iloc[-1]) if len(l) >= 252 else float(l.min())
             pct_off_low = (price - l52) / l52 * 100
 
+            # — reversal confirmation (the "it's actually climbing back" signals)
+            bot_days, _rsi_low, rsi_up_from_low = rsi_inflection(r_ser, lookback=10)
+            rsi_turning = (bot_days is not None
+                           and 1 <= bot_days <= 7
+                           and rsi_up_from_low is not None
+                           and rsi_up_from_low >= 3)
+            divergence  = bullish_rsi_divergence(c, r_ser, lookback=15)
+            macd_up     = macd_histogram_turning_up(c)
+            reclaim10   = ema_reclaim(c, span=10, min_below_days=5)
+            reclaim20   = ema_reclaim(c, span=20, min_below_days=5)
+            hl_struct   = higher_low_structure(l, lookback=15)
+            up_vol_exp  = up_vol_expansion(c, v, lookback=10)
+            upper_half  = closes_upper_half(h, l, c, days=2)
+
+            reversal_flags = {
+                "RSI↑":   rsi_turning,
+                "Div":    divergence,
+                "MACD↑":  macd_up,
+                "E10":    reclaim10,
+                "E20":    reclaim20 and not reclaim10,  # don't double-count
+                "HL":     hl_struct,
+                "UpV":    up_vol_exp,
+                "UpHalf": upper_half,
+            }
+            rev_count = sum(1 for x in reversal_flags.values() if x)
+            # — hard gate: must show proven movement, not just oversold
+            if rev_count < 2:
+                continue
+
             info    = info_map.get(ticker, {})
             fwd_eps = info.get("forwardEps", None)
             cap     = info.get("marketCap", 0)
             cap_lbl = "Micro" if cap < 300e6 else ("Small" if cap < 2e9 else ("Mid" if cap < 10e9 else "Large"))
 
             sigs = {
-                "oversold_rsi":    1.0 if r < 28 else 0.7,
-                "red_streak":      1.0 if red_streak >= 3 else (0.5 if red_streak >= 2 else 0.0),
-                "hammer_candle":   1.0 if hammer else 0.0,
-                "vol_drying":      1.0 if vol_dry else 0.0,
-                "above_200":       1.0 if above_200 else 0.0,
-                "holding_support": 1.0 if pct_off_low > 5 else 0.0,
-                "big_selloff":     1.0 if loss_5d < -10 else (0.5 if loss_5d < -6 else 0.0),
-                "positive_eps":    1.0 if (fwd_eps and fwd_eps > 0) else 0.0,
-                "popular":         1.0 if pop_scores.get(ticker, 0) > 20 else 0.0,
+                # — oversold context (was the selloff real?)
+                "deep_oversold":    1.0 if rsi_min_10d < 25 else (0.7 if rsi_min_10d < 30 else 0.4),
+                "red_streak":       1.0 if red_streak >= 3 else (0.5 if red_streak >= 2 else 0.0),
+                "big_selloff":      1.0 if loss_5d < -10 else (0.5 if loss_5d < -6 else 0.0),
+                "vol_drying":       1.0 if vol_dry else 0.0,
+                # — reversal confirmation (is it actually climbing?)
+                "rsi_turning_up":   1.0 if rsi_turning else 0.0,
+                "rsi_divergence":   1.0 if divergence else 0.0,
+                "macd_hist_up":     1.0 if macd_up else 0.0,
+                "ema_reclaim":      1.0 if reclaim10 else (0.5 if reclaim20 else 0.0),
+                "higher_low":       1.0 if hl_struct else 0.0,
+                "up_vol_expand":    1.0 if up_vol_exp else 0.0,
+                "close_upper_half": 1.0 if upper_half else 0.0,
+                "hammer_candle":    1.0 if hammer else 0.0,
+                # — structural / quality
+                "above_200":        1.0 if above_200 else 0.0,
+                "holding_support":  1.0 if pct_off_low > 5 else 0.0,
+                "positive_eps":     1.0 if (fwd_eps and fwd_eps > 0) else 0.0,
+                "popular":          1.0 if pop_scores.get(ticker, 0) > 20 else 0.0,
             }
 
             conf = sig_score(sigs)
             if conf < 42:
                 continue
 
-            e20        = float(ema(c, 20).iloc[-1])
             target     = round(max(e20, price * (1 + atp / 100 * 1.5)), 2)
             stop       = round(price * (1 - atp / 100 * 0.8), 2)
             bounce_pct = round((target - price) / price * 100, 1)
             rr         = round((target - price) / (price - stop), 2) if price > stop else 0
+            industry   = info.get("industry", "—")
+            country    = info.get("country", "—")
+            signs_str  = " ".join(k for k, x in reversal_flags.items() if x) or "—"
 
             results.append(dict(
-                Ticker=ticker, Price=f"${price:.2f}", RSI=round(r, 1),
+                Ticker=ticker, Price=f"${price:.2f}",
+                RSI=round(r, 1), RSImin=round(rsi_min_10d, 1),
                 Loss5D=f"{loss_5d:.1f}%", RedDays=red_streak,
+                RevSigns=signs_str, Rev=rev_count,
                 Hammer="✅" if hammer else "—",
                 VolDry="✅" if vol_dry else "—",
                 Cap=cap_lbl,
                 Target=f"${target}(+{bounce_pct}%)",
                 Stop=f"${stop}", RR=f"1:{rr}",
                 PopScore=round(pop_scores.get(ticker, 0)),
-                Confidence=conf, _score=conf,
+                Confidence=conf, Industry=industry, Country=country,
+                _score=conf + rev_count * 2,  # bias toward setups with more confirmation
             ))
         except Exception:
             continue
@@ -1647,6 +2086,8 @@ def s6_sector_rotation(data_map, info_map, pop_scores):
     results = []
     for ticker, df in data_map.items():
         try:
+            if _is_blocked(ticker, info_map, 6):
+                continue
             info   = info_map.get(ticker, {})
             sector = info.get("sector", "")
             if not sector:
@@ -1697,6 +2138,8 @@ def s6_sector_rotation(data_map, info_map, pop_scores):
             target  = round(price * (1 + atp / 100 * 2), 2)
             stop    = round(max(e50, price * 0.92), 2)
             tgt_pct = round((target - price) / price * 100, 1)
+            industry = info.get("industry", "—")
+            country = info.get("country", "—")
 
             results.append(dict(
                 Ticker=ticker, Sector=mapped, SectorHeat=f"{s_score:+.0f}",
@@ -1704,7 +2147,8 @@ def s6_sector_rotation(data_map, info_map, pop_scores):
                 Mom5D=f"{m5d:+.1f}%", Mom20D=f"{m20d:+.1f}%", RVOL=f"{rv}x",
                 Target=f"${target}(+{tgt_pct}%)", Stop=f"${stop}",
                 PopScore=round(pop_scores.get(ticker, 0)),
-                Confidence=conf, _score=conf + s_score * 0.3,
+                Confidence=conf, Industry=industry, Country=country,
+                _score=conf + s_score * 0.3,
             ))
         except Exception:
             continue
@@ -1722,6 +2166,8 @@ def s7_orb(data_map, info_map, pop_scores, bench_c=None):
     results = []
     for ticker, df in data_map.items():
         try:
+            if _is_blocked(ticker, info_map, 7):
+                continue
             if len(df) < 21:
                 continue
             c, v, h, l, o = df["Close"], df["Volume"], df["High"], df["Low"], df["Open"]
@@ -1783,6 +2229,8 @@ def s7_orb(data_map, info_map, pop_scores, bench_c=None):
             target2  = round(today_h + orb_size * 1.5, 2)
             stop     = round(today_o * 0.985, 2)
             rr       = round((target - price) / (price - stop), 2) if price > stop else 0
+            industry = info.get("industry", "—")
+            country = info.get("country", "—")
 
             results.append(dict(
                 Ticker=ticker, Price=f"${price:.2f}",
@@ -1794,7 +2242,8 @@ def s7_orb(data_map, info_map, pop_scores, bench_c=None):
                 Target1=f"${target}", Target2=f"${target2}",
                 Stop=f"${stop}", RR=f"1:{rr}",
                 PopScore=round(pop),
-                Confidence=conf, _score=(conf + setupq) / 2,
+                Confidence=conf, Industry=industry, Country=country,
+                _score=(conf + setupq) / 2,
             ))
         except Exception:
             continue
@@ -1822,6 +2271,8 @@ def display(title, subtitle, rows, color):
         "Mom3M": 8, "UpDnVol": 9, "HH_HL": 7, "Timeframe": 10,
         "Gap": 7, "FlatBase": 9, "H52Break": 10,
         "Phase": 13, "SetupQ": 8,
+        "RSImin": 8, "RevSigns": 28, "Rev": 5,
+        "Industry": 20, "Country": 12,
     }
     t = Table(box=box.SIMPLE_HEAVY, header_style=f"bold {color}",
               show_lines=True, expand=True)
@@ -1888,11 +2339,12 @@ def main():
     ap.add_argument("--morning",       action="store_true")
     ap.add_argument("--ten-am",        action="store_true")
     ap.add_argument("--sources",       nargs="+",
-                    default=["finviz", "yahoo", "reddit", "insider", "quality"],
-                    choices=["finviz", "yahoo", "reddit", "nasdaq", "insider", "quality"])
+                    default=["finviz", "yahoo", "reddit", "insider", "quality", "momentum"],
+                    choices=["finviz", "yahoo", "reddit", "nasdaq", "insider", "quality", "momentum"])
     ap.add_argument("--max",           type=int, default=400)
     ap.add_argument("--export",        action="store_true")
     ap.add_argument("--show-universe", action="store_true")
+    ap.add_argument("--override_alpaca", action="store_true", help="Skip Alpaca and use yfinance only")
     args = ap.parse_args()
 
     console.print(Panel.fit(
@@ -1919,7 +2371,7 @@ def main():
         show=args.show_universe,
     )
 
-    data_map = fetch_price_data(tickers)
+    data_map = fetch_price_data(tickers, skip_alpaca=args.override_alpaca)
     info_map = fetch_fundamentals(list(data_map.keys()))
 
     # SPY benchmark for relative-strength scoring
@@ -1967,7 +2419,7 @@ def main():
     if 5 in run:
         r5 = s5_oversold_reversal(data_map, info_map, pop_scores)
         display("STRATEGY 5 — OVERSOLD REVERSAL HUNTER",
-                "RSI <32 | Hammer candle | Volume drying | Bounce to EMA | Run: Night before",
+                "Was oversold + ≥2 reversal signs (RSI↑/Div/MACD↑/EMA reclaim/HL/UpV/UpHalf) | Run: Night before",
                 r5, "cyan")
         exports["s5_oversold"] = r5
 
