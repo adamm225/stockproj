@@ -2,7 +2,7 @@
 ╔══════════════════════════════════════════════════════════════════════╗
 ║         NASDAQ POPULARITY-DRIVEN SCREENER  v4.0                     ║
 ║                                                                      ║
-║  Universe built from REAL retail popularity signals:                 ║
+║  Universe built from REAL retail + comprehensive coverage:           ║
 ║                                                                      ║
 ║  1. Finviz Most Active / Top Volume export  (no login, free)         ║
 ║  2. Yahoo Finance screener feeds  (most_actives, day_gainers,        ║
@@ -10,28 +10,28 @@
 ║  3. Reddit WSB + r/stocks + r/investing mention scraper              ║
 ║         (free PRAW API — needs a Reddit app, setup below)            ║
 ║  4. Finviz Trending / News Heat  (scrape trending page)              ║
-║  5. NASDAQ FTP full list  (fallback for broad coverage)              ║
-║  6. StockTwits trending + most active + bullish sentiment            ║
+║  5. Finnhub earnings calendar  (stocks announcing next 30 days)       ║
+║  6. NASDAQ FTP full list  (fallback for broad coverage)              ║
+║  7. StockTwits trending + most active + bullish sentiment            ║
 ║                                                                      ║
 ║  All sources are deduplicated + scored by POPULARITY RANK,           ║
+║  then ENRICHED with Finnhub fundamentals/insider/momentum,           ║
 ║  then fed into the 7 strategy screeners.                             ║
 ║                                                                      ║
-║  Price Data: Alpaca (paper trading) → yfinance fallback              ║
+║  Price Data: Polygon (Stocks Starter) → yfinance fallback           ║
+║  Fundamental Data: yfinance (.info) + Polygon short interest         ║
 ║  Install:                                                            ║
 ║    pip install yfinance pandas numpy requests rich pytz              ║
 ║               beautifulsoup4 lxml praw vaderSentiment                ║
-║               alpaca-py                                              ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
-ALPACA SETUP (optional, free paper trading):
-  For daily bars from Alpaca instead of yfinance (faster, more reliable):
-  1. Go to https://alpaca.markets and sign up for a paper trading account
-  2. Go to https://app.alpaca.markets/brokerage/account/api
-  3. Copy your API Key and Secret Key
-  4. Set environment variables:
-       export ALPACA_API_KEY="your_key_here"
-       export ALPACA_SECRET_KEY="your_secret_here"
-  Note: Paper trading key auto-routes to paper-api.alpaca.markets
+POLYGON SETUP (primary price + reference data):
+  1. Sign up at https://polygon.io and subscribe to a Stocks plan
+  2. Copy your API key from the dashboard
+  3. Set it in your .env (only the key is needed — name is not used):
+       POLYGON_KEY="your_key_here"
+  Provides: daily OHLCV bars, ticker details, short interest, gainers/losers.
+  If POLYGON_KEY is missing or a ticker isn't covered, yfinance is used.
 
 REDDIT SETUP (one-time, free):
   1. Go to https://www.reddit.com/prefs/apps
@@ -43,12 +43,12 @@ REDDIT SETUP (one-time, free):
        export REDDIT_CLIENT_SECRET=xxxx
 
 Usage:
-  python nasdaq_screener_v4.py                    # all 7 strategies
+  python nasdaq_screener_v4.py                    # all 7 strategies (incl. Finnhub)
   python nasdaq_screener_v4.py --strategy 1       # specific strategy (1-7)
   python nasdaq_screener_v4.py --overnight        # strategies 4,5,6 (night prep)
   python nasdaq_screener_v4.py --morning          # strategies 1,2,3 (premarket)
   python nasdaq_screener_v4.py --ten-am           # strategy 7 (10 AM ORB)
-  python nasdaq_screener_v4.py --sources finviz yahoo reddit
+  python nasdaq_screener_v4.py --sources finviz yahoo reddit finnhub
   python nasdaq_screener_v4.py --max 300          # cap tickers to screen
   python nasdaq_screener_v4.py --export           # save CSV output
   python nasdaq_screener_v4.py --show-universe    # print full ranked universe
@@ -64,6 +64,7 @@ import random
 import warnings
 from collections import defaultdict
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dotenv import load_dotenv
 
@@ -75,13 +76,12 @@ import yfinance as yf
 
 load_dotenv()
 
-try:
-    from alpaca.data.historical import StockHistoricalDataClient
-    from alpaca.data.requests import StockBarsRequest
-    from alpaca.data.timeframe import TimeFrame
-    ALPACA_AVAILABLE = True
-except ImportError:
-    ALPACA_AVAILABLE = False
+# ──────────────────────────────────────────────
+#  POLYGON CONFIG  (primary price + reference data)
+#  Stocks Starter plan — only the API key is needed.
+# ──────────────────────────────────────────────
+POLYGON_KEY  = os.environ.get("POLYGON_KEY", "")
+POLYGON_BASE = "https://api.polygon.io"
 
 from rich import box
 from rich.console import Console
@@ -182,7 +182,7 @@ def _finviz_parse_tickers(html: str) -> list:
     return tickers
 
 
-def fetch_finviz_active(top_n: int = 300) -> dict:
+def fetch_finviz_active(top_n: int = 300, max_pages: int = 5) -> dict:
     """
     Scrape Finviz screener using the v=111 (overview) layout.
     Uses proper URL encoding, rotated UA, and exponential back-off on 429/403.
@@ -218,7 +218,7 @@ def fetch_finviz_active(top_n: int = 300) -> dict:
         page_tickers = []
         consecutive_empty = 0
 
-        for page in range(5):   # up to 5 pages × 20 = 100 per filter
+        for page in range(max_pages):   # 20 tickers per page per filter
             row_start = page * 20 + 1
             url = base_url.format(f=f_str, r=row_start)
 
@@ -667,6 +667,272 @@ def fetch_reddit_mentions(hours_back: int = 24, post_limit: int = 500) -> dict:
 #  NASDAQ FTP FULL LIST  (fallback)
 # ──────────────────────────────────────────────
 
+def fetch_finnhub_earnings_calendar(days_ahead: int = 30, top_n: int = 150) -> dict:
+    """
+    Fetch upcoming earnings from Finnhub's free earnings calendar.
+    Earnings announcements often precede significant moves.
+
+    Free tier: 60 reqs/min.
+    Docs: https://finnhub.io/docs/api/earnings-calendar
+    """
+    api_key = os.environ.get("FIN_KEY")
+    if not api_key:
+        console.print("  [yellow]⚠ Finnhub API key not set (FIN_KEY env var)[/yellow]")
+        return {}
+
+    result = {}
+    today = datetime.now().date()
+    from_date = today.isoformat()
+    to_date = (today + timedelta(days=days_ahead)).isoformat()
+
+    url = f"https://finnhub.io/api/v1/calendar/earnings?from={from_date}&to={to_date}&token={api_key}"
+
+    try:
+        resp = requests.get(url, timeout=10)
+
+        if resp.status_code == 401:
+            console.print(f"  [yellow]⚠ Finnhub earnings calendar: API key not authorized[/yellow]")
+            return {}
+        elif resp.status_code != 200:
+            console.print(f"  [yellow]⚠ Finnhub earnings calendar returned {resp.status_code}[/yellow]")
+            return {}
+
+        data = resp.json()
+
+        if "earningsCalendar" in data:
+            for earning in data["earningsCalendar"][:top_n]:
+                symbol = earning.get("symbol", "").strip()
+                if symbol and len(symbol) <= 5 and symbol.isalpha() and symbol not in TICKER_BLACKLIST:
+                    result[symbol] = result.get(symbol, 0) + 1.0
+
+            console.print(f"  [green]✔ Finnhub Earnings Calendar: {len(result)} tickers[/green]")
+
+    except Exception as e:
+        console.print(f"  [yellow]⚠ Finnhub earnings calendar failed: {e}[/yellow]")
+
+    return result
+
+
+def _fetch_insider_single(ticker: str, api_key: str) -> tuple:
+    """Fetch insider data for a single ticker."""
+    try:
+        url = f"https://finnhub.io/api/v1/stock/insider-transactions?symbol={ticker}&token={api_key}"
+        resp = requests.get(url, timeout=8)
+
+        if resp.status_code == 200:
+            data = resp.json()
+            if "data" in data and isinstance(data["data"], list):
+                buys = sum(1 for tx in data["data"][:20] if tx.get("change") and tx["change"] > 0)
+                sells = sum(1 for tx in data["data"][:20] if tx.get("change") and tx["change"] < 0)
+
+                if buys > sells:
+                    return (ticker, float(buys) * 0.8)
+    except Exception:
+        pass
+    return None
+
+
+def fetch_finnhub_insider_buying(tickers: list, top_n: int = 100) -> dict:
+    """
+    Score tickers by insider transaction activity (buying > selling).
+    Uses ThreadPoolExecutor for concurrent requests (5 workers, respects rate limits).
+    Free tier: 60 reqs/min.
+    Docs: https://finnhub.io/docs/api/insider-transactions
+    """
+    api_key = os.environ.get("FIN_KEY")
+    if not api_key:
+        return {}
+
+    result = {}
+    sample = tickers[:top_n]
+
+    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                  BarColumn(), TaskProgressColumn(),
+                  console=console) as prog:
+        task = prog.add_task(f"[cyan]Finnhub insider activity ({len(sample)} tickers)...",
+                             total=len(sample))
+
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {executor.submit(_fetch_insider_single, ticker, api_key): ticker for ticker in sample}
+
+            for future in as_completed(futures):
+                try:
+                    res = future.result()
+                    if res:
+                        ticker, score = res
+                        result[ticker] = score
+                except Exception:
+                    pass
+
+                prog.advance(task)
+                time.sleep(0.1)  # Rate limit friendly
+
+    if result:
+        console.print(f"  [green]✔ Finnhub Insider Buying: {len(result)} tickers with net buying[/green]")
+    else:
+        console.print(f"  [yellow]⚠ Finnhub Insider: no significant insider buying detected[/yellow]")
+
+    return result
+
+
+def _fetch_fundamentals_single(ticker: str, api_key: str) -> tuple:
+    """Fetch fundamentals for a single ticker."""
+    try:
+        url = f"https://finnhub.io/api/v1/stock/metric?symbol={ticker}&metric=all&token={api_key}"
+        resp = requests.get(url, timeout=8)
+
+        if resp.status_code == 200:
+            data = resp.json()
+            if "metric" in data:
+                m = data["metric"]
+                score = 0.0
+
+                pe = m.get("peNormalizedAnnual")
+                if pe and 5 < pe < 25:
+                    score += 1.0
+
+                pb = m.get("pbAnnual")
+                if pb and 0.5 < pb < 3.0:
+                    score += 0.8
+
+                roe = m.get("roeAnnual")
+                if roe and roe > 0.15:
+                    score += 1.2
+
+                eps = m.get("epsAnnual")
+                if eps and eps > 0:
+                    score += 0.6
+
+                if score > 1.5:
+                    return (ticker, score)
+    except Exception:
+        pass
+    return None
+
+
+def fetch_finnhub_fundamentals_undervalued(tickers: list, top_n: int = 150) -> dict:
+    """
+    Score undervalued + quality stocks using Finnhub basic financials.
+    Uses ThreadPoolExecutor for concurrent requests (5 workers, respects rate limits).
+    Filters: Low PE, Low P/B, High ROE, Positive earnings.
+    Free tier: 60 reqs/min.
+    Docs: https://finnhub.io/docs/api/company-basic-financials
+    """
+    api_key = os.environ.get("FIN_KEY")
+    if not api_key:
+        return {}
+
+    result = {}
+    sample = tickers[:top_n]
+
+    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                  BarColumn(), TaskProgressColumn(),
+                  console=console) as prog:
+        task = prog.add_task(f"[cyan]Finnhub fundamentals ({len(sample)} tickers)...",
+                             total=len(sample))
+
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {executor.submit(_fetch_fundamentals_single, ticker, api_key): ticker for ticker in sample}
+
+            for future in as_completed(futures):
+                try:
+                    res = future.result()
+                    if res:
+                        ticker, score = res
+                        result[ticker] = score
+                except Exception:
+                    pass
+
+                prog.advance(task)
+                time.sleep(0.1)  # Rate limit friendly
+
+    if result:
+        console.print(f"  [green]✔ Finnhub Value Screen: {len(result)} undervalued + quality tickers[/green]")
+    else:
+        console.print(f"  [yellow]⚠ Finnhub Value: no undervalued stocks found[/yellow]")
+
+    return result
+
+
+def _fetch_quotes_single(ticker: str, api_key: str) -> tuple:
+    """Fetch quote data for a single ticker."""
+    try:
+        url = f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={api_key}"
+        resp = requests.get(url, timeout=8)
+
+        if resp.status_code == 200:
+            data = resp.json()
+            score = 0.0
+
+            change_pct = data.get("d", 0)
+            if abs(change_pct) > 2:
+                score += 0.5 * min(abs(change_pct) / 10, 2)
+
+            current_vol = data.get("v", 0)
+            prev_close_vol = data.get("prevV", 1)
+            if prev_close_vol > 0:
+                rel_vol = current_vol / prev_close_vol
+                if rel_vol > 1.2:
+                    score += 0.6 * min(rel_vol, 2)
+
+            bid = data.get("bid", 0)
+            ask = data.get("ask", 0)
+            if bid > 0 and ask > bid:
+                spread_pct = ((ask - bid) / bid) * 100
+                if spread_pct < 1.0:
+                    score += 0.4
+
+            if score > 0.5:
+                return (ticker, score)
+    except Exception:
+        pass
+    return None
+
+
+def fetch_finnhub_quotes_momentum(tickers: list, top_n: int = 150) -> dict:
+    """
+    Score stocks by momentum signals from quote data.
+    Uses ThreadPoolExecutor for concurrent requests (5 workers, respects rate limits).
+    Filters: % change, relative volume, bid-ask spread.
+    Free tier: 60 reqs/min.
+    Docs: https://finnhub.io/docs/api/quote
+    """
+    api_key = os.environ.get("FIN_KEY")
+    if not api_key:
+        return {}
+
+    result = {}
+    sample = tickers[:top_n]
+
+    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                  BarColumn(), TaskProgressColumn(),
+                  console=console) as prog:
+        task = prog.add_task(f"[cyan]Finnhub quotes & momentum ({len(sample)} tickers)...",
+                             total=len(sample))
+
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {executor.submit(_fetch_quotes_single, ticker, api_key): ticker for ticker in sample}
+
+            for future in as_completed(futures):
+                try:
+                    res = future.result()
+                    if res:
+                        ticker, score = res
+                        result[ticker] = score
+                except Exception:
+                    pass
+
+                prog.advance(task)
+                time.sleep(0.1)  # Rate limit friendly
+
+    if result:
+        console.print(f"  [green]✔ Finnhub Momentum: {len(result)} tickers with positive momentum[/green]")
+    else:
+        console.print(f"  [yellow]⚠ Finnhub Momentum: no momentum signals detected[/yellow]")
+
+    return result
+
+
 def fetch_nasdaq_ftp() -> dict:
     url = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
     try:
@@ -769,7 +1035,7 @@ def fetch_openinsider_clusters(top_n: int = 150) -> dict:
 #  FINVIZ QUALITY  (fundamentals + near-breakout filter)
 # ──────────────────────────────────────────────
 
-def fetch_finviz_quality(top_n: int = 200) -> dict:
+def fetch_finviz_quality(top_n: int = 200, max_pages: int = 3) -> dict:
     """
     Pull a 'quality + setup' universe from Finviz's free screener.
 
@@ -806,7 +1072,7 @@ def fetch_finviz_quality(top_n: int = 200) -> dict:
 
     for f_str, label, weight in screens:
         page_tickers = []
-        for page in range(3):  # 3 pages × 20 = 60 per screen is plenty
+        for page in range(max_pages):  # 20 tickers per page per screen
             row_start = page * 20 + 1
             url = base_url.format(f=f_str, r=row_start)
             html = None
@@ -846,7 +1112,7 @@ def fetch_finviz_quality(top_n: int = 200) -> dict:
     return results
 
 
-def fetch_finviz_momentum(top_n: int = 200) -> dict:
+def fetch_finviz_momentum(top_n: int = 200, max_pages: int = 5) -> dict:
     """
     Pull a low-priced, high-volume momentum/breakout screen from Finviz.
 
@@ -880,7 +1146,7 @@ def fetch_finviz_momentum(top_n: int = 200) -> dict:
     base_url = "https://finviz.com/screener.ashx?v=111&f={f}&r={r}"
     all_tickers = []
 
-    for page in range(5):  # up to 5 pages * 20 = 100 tickers
+    for page in range(max_pages):  # 20 tickers per page
         row_start = page * 20 + 1
         url = base_url.format(f=f_str, r=row_start)
         html = None
@@ -924,14 +1190,29 @@ def fetch_finviz_momentum(top_n: int = 200) -> dict:
 #  UNIVERSE BUILDER
 # ──────────────────────────────────────────────
 
-def build_universe(sources: list, max_tickers: int = 500, show: bool = False) -> tuple:
+def build_universe(sources: list, max_tickers: int = 500, show: bool = False,
+                   large: bool = False) -> tuple:
     console.print(Panel.fit("[bold]🌐 BUILDING POPULARITY UNIVERSE[/bold]", border_style="blue"))
     combined = defaultdict(float)
     finviz_hit = False
 
+    # In large mode pull deeper from the *quality-filtered* Finviz screens
+    # (more pages of the same screened results) rather than dumping the raw
+    # NASDAQ FTP list — keeps signal quality high while widening the net.
+    if large:
+        active_topn, active_pages   = 600, 12
+        quality_topn, quality_pages = 450, 8
+        moment_topn, moment_pages   = 400, 10
+        console.print(f"[bold magenta]🔭 LARGE UNIVERSE mode — deepening quality screens "
+                      f"(cap {max_tickers:,})[/bold magenta]")
+    else:
+        active_topn, active_pages   = 300, 5
+        quality_topn, quality_pages = 200, 3
+        moment_topn, moment_pages   = 200, 5
+
     if "finviz" in sources:
         console.print("[cyan]📊 Finviz active/volume/gainer feeds...[/cyan]")
-        fv = fetch_finviz_active()
+        fv = fetch_finviz_active(top_n=active_topn, max_pages=active_pages)
         if fv:
             finviz_hit = True
             for t, s in fv.items():
@@ -958,6 +1239,11 @@ def build_universe(sources: list, max_tickers: int = 500, show: bool = False) ->
     for t, s in fetch_stocktwits_sentiment().items():
         combined[t] += s * 1.3
 
+    if "movers" in sources:
+        console.print("[cyan]🔥 Polygon gainers/losers snapshot...[/cyan]")
+        for t, s in fetch_polygon_movers().items():
+            combined[t] += s * 1.5
+
     if "reddit" in sources:
         console.print("[cyan]🤖 Reddit WSB + stocks mention scraper...[/cyan]")
         for t, s in fetch_reddit_mentions().items():
@@ -970,15 +1256,20 @@ def build_universe(sources: list, max_tickers: int = 500, show: bool = False) ->
 
     if "quality" in sources:
         console.print("[cyan]💎 Finviz quality screen (growth + margin + near 52wH)...[/cyan]")
-        for t, s in fetch_finviz_quality().items():
+        for t, s in fetch_finviz_quality(top_n=quality_topn, max_pages=quality_pages).items():
             combined[t] += s * 1.6
 
     if "momentum" in sources:
         console.print("[cyan]🚀 Finviz momentum (low-float NASDAQ, relvol>1.5, vol>3%w)...[/cyan]")
-        for t, s in fetch_finviz_momentum().items():
+        for t, s in fetch_finviz_momentum(top_n=moment_topn, max_pages=moment_pages).items():
             combined[t] += s * 2.0  # high-conviction setup screen for 10-15% swings
 
-    if "nasdaq" in sources or not combined:
+    if "finnhub" in sources:
+        console.print("[cyan]📅 Finnhub earnings calendar (next 30 days)...[/cyan]")
+        for t, s in fetch_finnhub_earnings_calendar().items():
+            combined[t] += s * 1.1
+
+    if "nasdaq" in sources or (not combined and "finnhub" not in sources):
         console.print("[cyan]🗄  NASDAQ FTP full list (coverage fallback)...[/cyan]")
         for t, s in fetch_nasdaq_ftp().items():
             if t not in combined:
@@ -988,7 +1279,27 @@ def build_universe(sources: list, max_tickers: int = 500, show: bool = False) ->
     ranked = [(t, s) for t, s in ranked if 1 <= len(t) <= 5 and t.isalpha()]
     top    = ranked[:max_tickers]
 
-    console.print(f"\n[bold green]Universe: {len(top):,} tickers (ranked by retail popularity)[/bold green]\n")
+    console.print(f"\n[bold]📊 Base Universe: {len(top):,} tickers[/bold]\n")
+
+    # Enrich with Finnhub fundamentals + insider + momentum
+    universe_tickers = [t for t, _ in top]
+
+    console.print("[cyan]📈 Enriching universe with Finnhub data...[/cyan]")
+
+    for t, s in fetch_finnhub_insider_buying(universe_tickers).items():
+        combined[t] += s * 1.4
+
+    for t, s in fetch_finnhub_fundamentals_undervalued(universe_tickers).items():
+        combined[t] += s * 1.2
+
+    for t, s in fetch_finnhub_quotes_momentum(universe_tickers).items():
+        combined[t] += s * 0.9
+
+    # Re-rank after Finnhub enrichment
+    combined_final = sorted(combined.items(), key=lambda x: x[1], reverse=True)
+    top = combined_final[:max_tickers]
+
+    console.print(f"\n[bold green]Final Universe: {len(top):,} tickers (ranked by popularity + fundamentals)[/bold green]\n")
 
     if show:
         console.print("[bold]Top 50 Most Popular Tickers:[/bold]")
@@ -1002,160 +1313,202 @@ def build_universe(sources: list, max_tickers: int = 500, show: bool = False) ->
 
 
 # ──────────────────────────────────────────────
-#  ALPACA DATA FETCHER (Paper Trading API)
+#  POLYGON DATA FETCHER  (Stocks Starter REST API)
 # ──────────────────────────────────────────────
 
-def fetch_alpaca_daily(tickers: list, days_back: int = 252) -> dict:
-    """
-    Fetch daily OHLCV bars from Alpaca's StockHistoricalDataClient.
-    Requests in batches and skips invalid symbols gracefully.
+def _polygon_get(session, url: str, params: dict, retries: int = 3):
+    """GET a Polygon endpoint with API-key auth and 429 back-off. Returns parsed JSON or None."""
+    params = {**params, "apiKey": POLYGON_KEY}
+    for attempt in range(retries):
+        try:
+            r = session.get(url, params=params, timeout=15)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 429:
+                time.sleep(2 ** attempt + random.uniform(0.2, 0.8))
+                continue
+            return None
+        except requests.exceptions.RequestException:
+            time.sleep(0.5 * (attempt + 1))
+    return None
 
-    Credentials via environment variables (secure):
-      export ALPACA_API_KEY="your_key"
-      export ALPACA_SECRET_KEY="your_secret"
+
+def fetch_polygon_daily(tickers: list, days_back: int = 400) -> dict:
+    """
+    Fetch split-adjusted daily OHLCV bars from Polygon's aggregates endpoint,
+    one ticker per request, concurrently.
 
     Returns:
-      {ticker: DataFrame} with OHLCV columns (compatible with yfinance format)
+      {ticker: DataFrame} with Open/High/Low/Close/Volume columns and a
+      DatetimeIndex — same shape yfinance/the strategies expect.
     """
-    console.print(f"[dim][DEBUG] ALPACA_AVAILABLE={ALPACA_AVAILABLE}[/dim]")
-    if not ALPACA_AVAILABLE:
-        console.print("[dim][DEBUG] Alpaca not available (import failed)[/dim]")
-        return {}
-
-    api_key = os.environ.get("ALPACA_API_KEY")
-    secret_key = os.environ.get("ALPACA_SECRET_KEY")
-
-    console.print(f"[dim][DEBUG] API Key set: {bool(api_key)}, Secret set: {bool(secret_key)}[/dim]")
-
-    if not api_key or not secret_key:
+    if not POLYGON_KEY:
         console.print(
-            "[yellow]⚠ ALPACA_API_KEY / ALPACA_SECRET_KEY not in environment — using yfinance[/yellow]\n"
-            "[dim]To use Alpaca: export ALPACA_API_KEY=... && export ALPACA_SECRET_KEY=...[/dim]\n"
+            "[yellow]⚠ POLYGON_KEY not in environment — falling back to yfinance[/yellow]\n"
+            "[dim]Add POLYGON_KEY=... to your .env to use Polygon for price data.[/dim]\n"
         )
         return {}
 
-    data_map = {}
-    try:
-        console.print(f"[dim][DEBUG] Creating Alpaca client...[/dim]")
-        client = StockHistoricalDataClient(api_key, secret_key)
-        console.print(f"[dim][DEBUG] Client created successfully[/dim]")
+    end_date   = datetime.now().date()
+    start_date = end_date - timedelta(days=days_back)
+    start, end = start_date.isoformat(), end_date.isoformat()
+    data_map   = {}
 
-        end_date = datetime.now().date()
-        start_date = end_date - timedelta(days=days_back)
-        console.print(f"[dim][DEBUG] Requesting {len(tickers)} tickers for {start_date} to {end_date}[/dim]")
+    def fetch_one(session, ticker):
+        url = f"{POLYGON_BASE}/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}"
+        data = _polygon_get(session, url, {"adjusted": "true", "sort": "asc", "limit": 50000})
+        if not data or data.get("status") not in ("OK", "DELAYED") or not data.get("results"):
+            return ticker, None
+        rows = data["results"]
+        if len(rows) < 15:
+            return ticker, None
+        df = pd.DataFrame(rows)
+        df["timestamp"] = pd.to_datetime(df["t"], unit="ms")
+        df = df.set_index("timestamp")
+        df = df.rename(columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
+        df = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close", "Volume"])
+        return (ticker, df) if len(df) >= 15 else (ticker, None)
 
-        def fetch_batch(batch_tickers):
-            """Try to fetch a batch of tickers. If it fails due to invalid symbol, split and retry."""
-            if not batch_tickers:
-                return {}
+    session = requests.Session()
+    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                  BarColumn(), TaskProgressColumn(), console=console) as prog:
+        task = prog.add_task(f"[cyan]Downloading {len(tickers)} tickers (Polygon)...", total=len(tickers))
+        with ThreadPoolExecutor(max_workers=20) as ex:
+            futures = {ex.submit(fetch_one, session, t): t for t in tickers}
+            for fut in as_completed(futures):
+                try:
+                    ticker, df = fut.result()
+                    if df is not None:
+                        data_map[ticker] = df
+                except Exception:
+                    pass
+                prog.advance(task)
 
-            try:
-                request = StockBarsRequest(
-                    symbol_or_symbols=batch_tickers,
-                    timeframe=TimeFrame.Day,
-                    start=start_date,
-                    end=end_date,
-                )
-                bars = client.get_stock_bars(request)
+    if data_map:
+        console.print(f"[green]✔ Polygon: {len(data_map)}/{len(tickers)} tickers loaded[/green]")
+    else:
+        console.print("[yellow]⚠ Polygon returned 0 tickers[/yellow]")
+    return data_map
 
-                result = {}
 
-                # Use bars.data (dict[ticker -> list of Bar objects]) like alpacacount.py does
-                if hasattr(bars, 'data') and bars.data is not None:
-                    data_source = bars.data
-                    console.print(f"[dim][DEBUG] Using bars.data with {len(data_source)} tickers[/dim]")
+def fetch_polygon_short_interest(tickers: list, max_workers: int = 20) -> dict:
+    """
+    Pull the most recent FINRA short-interest record per ticker from Polygon.
 
-                    for ticker in batch_tickers:
-                        if ticker in data_source:
-                            ticker_data = data_source[ticker]
-                            # Convert list of Bar objects to DataFrame
-                            try:
-                                df = pd.DataFrame([{
-                                    "timestamp": bar.timestamp,
-                                    "open": bar.open,
-                                    "high": bar.high,
-                                    "low": bar.low,
-                                    "close": bar.close,
-                                    "volume": bar.volume
-                                } for bar in ticker_data])
-
-                                df.set_index("timestamp", inplace=True)
-                                if len(df) >= 15:
-                                    df = df[["open", "high", "low", "close", "volume"]].copy()
-                                    df.columns = [c.title() for c in df.columns]
-                                    df = df.dropna()
-                                    if len(df) >= 15:
-                                        result[ticker] = df
-                            except Exception as e:
-                                console.print(f"[dim][DEBUG] Failed to process {ticker}: {e}[/dim]")
-                                continue
-
-                return result
-            except Exception as e:
-                error_msg = str(e)
-                if "invalid symbol" in error_msg.lower() and len(batch_tickers) > 1:
-                    console.print(f"[yellow]Invalid symbol in batch of {len(batch_tickers)}, splitting...[/yellow]")
-                    mid = len(batch_tickers) // 2
-                    result = {}
-                    result.update(fetch_batch(batch_tickers[:mid]))
-                    result.update(fetch_batch(batch_tickers[mid:]))
-                    return result
-                else:
-                    console.print(f"[dim]Batch failed ({len(batch_tickers)} tickers): {error_msg}[/dim]")
-                    return {}
-
-        batch_size = 100
-        batches = [tickers[i:i+batch_size] for i in range(0, len(tickers), batch_size)]
-
-        # DEBUG: Check what we got back from a test batch
-        if batches:
-            test_batch = batches[0][:5] if len(batches[0]) > 5 else batches[0]
-            console.print(f"[dim][DEBUG] Testing first batch with {len(test_batch)} tickers: {test_batch}[/dim]")
-
-        for batch in batches:
-            batch_result = fetch_batch(batch)
-            data_map.update(batch_result)
-
-        if data_map:
-            console.print(f"[green]✔ Alpaca: {len(data_map)}/{len(tickers)} tickers loaded[/green]")
-        else:
-            console.print(f"[yellow][DEBUG] Alpaca returned 0 tickers[/yellow]")
-        return data_map
-
-    except Exception as e:
-        console.print(f"[yellow]⚠ Alpaca fetch failed: {e}[/yellow]")
+    Returns:
+      {ticker: {"short_interest": int, "avg_daily_volume": float, "days_to_cover": float}}
+    """
+    if not POLYGON_KEY:
         return {}
+
+    result = {}
+
+    def fetch_one(session, ticker):
+        url = f"{POLYGON_BASE}/stocks/v1/short-interest"
+        data = _polygon_get(session, url, {"ticker": ticker, "limit": 1000})
+        if not data or not data.get("results"):
+            return ticker, None
+        latest = max(data["results"], key=lambda r: r.get("settlement_date", ""))
+        return ticker, {
+            "short_interest":   latest.get("short_interest"),
+            "avg_daily_volume": latest.get("avg_daily_volume"),
+            "days_to_cover":    latest.get("days_to_cover"),
+        }
+
+    session = requests.Session()
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(fetch_one, session, t): t for t in tickers}
+        for fut in as_completed(futures):
+            try:
+                ticker, rec = fut.result()
+                if rec:
+                    result[ticker] = rec
+            except Exception:
+                pass
+    return result
+
+
+def enrich_short_interest(info_map: dict) -> None:
+    """
+    Compute shortPercentOfFloat from Polygon short interest and write it into
+    info_map in place (Polygon data overrides yfinance, which is often empty).
+    Float base = yfinance floatShares, else sharesOutstanding.
+    """
+    if not POLYGON_KEY or not info_map:
+        return
+    si_map = fetch_polygon_short_interest(list(info_map.keys()))
+    if not si_map:
+        return
+    enriched = 0
+    for ticker, rec in si_map.items():
+        info  = info_map.get(ticker, {})
+        si    = rec.get("short_interest")
+        base  = info.get("floatShares") or info.get("sharesOutstanding")
+        if si and base and base > 0:
+            info["shortPercentOfFloat"] = si / base
+            enriched += 1
+        if rec.get("days_to_cover") is not None:
+            info["daysToCover"] = rec["days_to_cover"]
+        info_map[ticker] = info
+    console.print(f"[green]✔ Polygon short interest: {enriched} tickers enriched[/green]")
+
+
+def fetch_polygon_movers() -> dict:
+    """
+    Polygon snapshot gainers + losers as a popularity/universe source.
+    Top movers get a score weighted by absolute % change.
+
+    Returns:
+      {ticker: score}
+    """
+    if not POLYGON_KEY:
+        return {}
+
+    results = {}
+    session = requests.Session()
+    for direction in ("gainers", "losers"):
+        url  = f"{POLYGON_BASE}/v2/snapshot/locale/us/markets/stocks/{direction}"
+        data = _polygon_get(session, url, {})
+        if not data or not data.get("tickers"):
+            continue
+        for obj in data["tickers"]:
+            ticker = (obj.get("ticker") or "").upper()
+            chg    = abs(obj.get("todaysChangePerc", 0) or 0)
+            if ticker:
+                results[ticker] = results.get(ticker, 0) + min(chg, 30)
+        console.print(f"  [green]✔ Polygon {direction}: {len(data['tickers'])} tickers[/green]")
+    return results
 
 
 # ──────────────────────────────────────────────
 #  DATA FETCHER
 # ──────────────────────────────────────────────
 
-def fetch_price_data(tickers: list, period: str = "1y", skip_alpaca: bool = False) -> dict:
+def fetch_price_data(tickers: list, period: str = "1y", skip_polygon: bool = False) -> dict:
     console.print(f"[dim][DEBUG] fetch_price_data: starting with {len(tickers)} tickers[/dim]")
-    # Try Alpaca first (if credentials available and not overridden)
-    alpaca_map = {} if skip_alpaca else fetch_alpaca_daily(tickers, days_back=252)
-    if skip_alpaca:
-        console.print(f"[dim][DEBUG] Alpaca skipped (--override_alpaca)[/dim]")
+    # Try Polygon first (if key available and not overridden)
+    polygon_map = {} if skip_polygon else fetch_polygon_daily(tickers, days_back=400)
+    if skip_polygon:
+        console.print(f"[dim][DEBUG] Polygon skipped (--override_polygon)[/dim]")
     else:
-        console.print(f"[dim][DEBUG] Alpaca returned {len(alpaca_map)} tickers[/dim]")
+        console.print(f"[dim][DEBUG] Polygon returned {len(polygon_map)} tickers[/dim]")
 
-    if alpaca_map:
-        # Alpaca succeeded for some; use it and only yfinance for missing
-        missing = [t for t in tickers if t not in alpaca_map]
-        console.print(f"[dim][DEBUG] Missing from Alpaca: {len(missing)} tickers[/dim]")
+    if polygon_map:
+        # Polygon succeeded for some; use it and only yfinance for missing
+        missing = [t for t in tickers if t not in polygon_map]
+        console.print(f"[dim][DEBUG] Missing from Polygon: {len(missing)} tickers[/dim]")
         if not missing:
-            console.print(f"[green]✔ Price data: {len(alpaca_map):,} tickers loaded (Alpaca)[/green]")
-            return alpaca_map
+            console.print(f"[green]✔ Price data: {len(polygon_map):,} tickers loaded (Polygon)[/green]")
+            return polygon_map
         # Fall through: fetch missing via yfinance
         tickers_to_fetch = missing
     else:
-        # Alpaca not available; fetch all from yfinance
-        console.print(f"[dim][DEBUG] Alpaca returned empty, fetching all {len(tickers)} from yfinance[/dim]")
+        # Polygon not available; fetch all from yfinance
+        console.print(f"[dim][DEBUG] Polygon returned empty, fetching all {len(tickers)} from yfinance[/dim]")
         tickers_to_fetch = tickers
 
     # Fetch from yfinance (full set or missing set)
-    data_map = alpaca_map.copy() if alpaca_map else {}
+    data_map = polygon_map.copy() if polygon_map else {}
     batch_size = 30
     batches = [tickers_to_fetch[i:i+batch_size] for i in range(0, len(tickers_to_fetch), batch_size)]
 
@@ -1182,7 +1535,7 @@ def fetch_price_data(tickers: list, period: str = "1y", skip_alpaca: bool = Fals
             prog.advance(task)
             time.sleep(0.2)
 
-    source = "Alpaca+yfinance" if alpaca_map else "yfinance"
+    source = "Polygon+yfinance" if polygon_map else "yfinance"
     console.print(f"[green]✔ Price data: {len(data_map):,} tickers loaded ({source})[/green]")
     return data_map
 
@@ -1310,6 +1663,93 @@ def closes_upper_half(h, l, c, days=2):
         if (float(c.iloc[i]) - float(l.iloc[i])) / rng < 0.5:
             return False
     return True
+
+def mfi(h, l, c, v, p=14):
+    """Money Flow Index — RSI weighted by dollar volume."""
+    if len(c) < p + 1:
+        return 50.0
+    tp = (h + l + c) / 3
+    mf = tp * v
+    pos_mf = mf.copy()
+    pos_mf[tp.diff() <= 0] = 0
+    pos_sum = pos_mf.rolling(p).sum()
+    total_sum = mf.rolling(p).sum()
+    raw_mfi = pos_sum / total_sum
+    return float((100 * raw_mfi).iloc[-1]) if total_sum.iloc[-1] > 0 else 50.0
+
+def catalyst_quality_score(info, c, h, l, o, v, bench_c, rvol_val, price):
+    """Score the quality of a catalyst move: float, short interest, RS, MFI, gap."""
+    scores = {}
+
+    # float-aware RVOL: small float amplifies the move
+    float_sh = info.get('floatShares')
+    if float_sh and float_sh > 0:
+        if float_sh < 50e6 and rvol_val >= 2.0:
+            scores['flt_rvol'] = 1.0
+        elif float_sh < 100e6 and rvol_val >= 1.5:
+            scores['flt_rvol'] = 0.7
+        elif rvol_val >= 3.0:
+            scores['flt_rvol'] = 0.5
+        else:
+            scores['flt_rvol'] = 0.0
+    else:
+        scores['flt_rvol'] = 0.0
+
+    # short interest: squeeze potential
+    short_pct = info.get('shortPercentOfFloat')
+    if short_pct:
+        if short_pct >= 0.30:
+            scores['short'] = 1.0
+        elif short_pct >= 0.15:
+            scores['short'] = 0.7
+        elif short_pct >= 0.10:
+            scores['short'] = 0.4
+        else:
+            scores['short'] = 0.0
+    else:
+        scores['short'] = 0.0
+
+    # RS vs benchmark: moving up while market is flat = real money
+    rs = rs_vs_benchmark(c, bench_c, periods=(5, 10)) if bench_c is not None else None
+    if rs is not None:
+        if rs > 5:
+            scores['rs'] = 1.0
+        elif rs > 2:
+            scores['rs'] = 0.7
+        elif rs > 0:
+            scores['rs'] = 0.4
+        else:
+            scores['rs'] = 0.0
+    else:
+        scores['rs'] = 0.0
+
+    # MFI: volume-weighted momentum, less noisy than RSI
+    mfi_val = mfi(h, l, c, v, p=14)
+    if mfi_val > 65:
+        scores['mfi'] = 1.0
+    elif mfi_val > 55:
+        scores['mfi'] = 0.7
+    elif mfi_val > 45:
+        scores['mfi'] = 0.4
+    else:
+        scores['mfi'] = 0.0
+
+    # gap quality: gap up and held above open
+    if len(o) > 0 and len(c) > 1:
+        gap_pct = (float(o.iloc[-1]) - float(c.iloc[-2])) / float(c.iloc[-2]) * 100
+        close_rng = (float(c.iloc[-1]) - float(l.iloc[-1])) / max(0.01, float(h.iloc[-1]) - float(l.iloc[-1]))
+        if gap_pct > 2.0 and close_rng > 0.6:
+            scores['gap'] = 1.0
+        elif gap_pct > 1.0 and close_rng > 0.5:
+            scores['gap'] = 0.6
+        elif gap_pct > 0.0 and close_rng > 0.5:
+            scores['gap'] = 0.3
+        else:
+            scores['gap'] = 0.0
+    else:
+        scores['gap'] = 0.0
+
+    return round(sum(scores.values()) / len(scores) * 100) if scores else 0
 
 def atr(h, l, c, p=14):
     tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
@@ -1590,12 +2030,13 @@ def s1_catalyst(data_map, info_map, pop_scores, bench_c=None):
                 continue
 
             setupq, phase, _meta = setup_quality_score(df, bench_c, pop)
+            info   = info_map.get(ticker, {})
+            catq   = catalyst_quality_score(info, c, h, l, o, v, bench_c, rv, price)
 
             target = round(price * (1 + atp / 100 * 2.2), 2)
             stop   = round(price * (1 - atp / 100 * 0.9), 2)
             rr     = round((target - price) / (price - stop), 2) if price > stop else 0
 
-            info   = info_map.get(ticker, {})
             cap    = info.get("marketCap", 0)
             cap_lbl= "Micro" if cap < 300e6 else ("Small" if cap < 2e9 else "Mid")
             industry = info.get("industry", "—")
@@ -1605,12 +2046,12 @@ def s1_catalyst(data_map, info_map, pop_scores, bench_c=None):
                 Ticker=ticker, Price=f"${price:.2f}", RVOL=f"{rv}x",
                 DayChg=f"{day_chg:+.1f}%", RSI=round(r, 1),
                 ATR_pct=f"{atp:.1f}%", Cap=cap_lbl,
-                Phase=phase, SetupQ=setupq,
+                Phase=phase, SetupQ=setupq, CatQ=catq,
                 Breakout="✅" if near_brk else "—",
                 PopScore=round(pop), Target=f"${target}",
                 Stop=f"${stop}", RR=f"1:{rr}",
                 Confidence=conf, Industry=industry, Country=country,
-                _score=(conf + setupq) / 2,
+                _score=(conf + setupq + catq) / 3,
             ))
         except Exception:
             continue
@@ -2271,7 +2712,7 @@ def display(title, subtitle, rows, color):
         "Mom3M": 8, "UpDnVol": 9, "HH_HL": 7, "Timeframe": 10,
         "Gap": 7, "FlatBase": 9, "H52Break": 10,
         "Phase": 13, "SetupQ": 8,
-        "RSImin": 8, "RevSigns": 28, "Rev": 5,
+        "RSImin": 8, "RevSigns": 28, "Rev": 5, "CatQ": 6,
         "Industry": 20, "Country": 12,
     }
     t = Table(box=box.SIMPLE_HEAVY, header_style=f"bold {color}",
@@ -2339,13 +2780,21 @@ def main():
     ap.add_argument("--morning",       action="store_true")
     ap.add_argument("--ten-am",        action="store_true")
     ap.add_argument("--sources",       nargs="+",
-                    default=["finviz", "yahoo", "reddit", "insider", "quality", "momentum"],
-                    choices=["finviz", "yahoo", "reddit", "nasdaq", "insider", "quality", "momentum"])
+                    default=["finviz", "yahoo", "reddit", "insider", "quality", "momentum", "finnhub", "movers"],
+                    choices=["finviz", "yahoo", "reddit", "nasdaq", "insider", "quality", "momentum", "finnhub", "movers"])
     ap.add_argument("--max",           type=int, default=400)
+    ap.add_argument("--large_universe", action="store_true",
+                    help="Fetch a wider universe by pulling deeper from the quality-filtered "
+                         "Finviz screens (more pages, higher cap). Defaults the cap to 1000.")
     ap.add_argument("--export",        action="store_true")
     ap.add_argument("--show-universe", action="store_true")
-    ap.add_argument("--override_alpaca", action="store_true", help="Skip Alpaca and use yfinance only")
+    ap.add_argument("--override_polygon", action="store_true", help="Skip Polygon and use yfinance only for price data")
     args = ap.parse_args()
+
+    # In large mode, raise the cap unless the user explicitly set --max
+    max_tickers = args.max
+    if args.large_universe and args.max == 400:
+        max_tickers = 1000
 
     console.print(Panel.fit(
         "[bold white]NASDAQ POPULARITY SCREENER  v4.0[/bold white]\n"
@@ -2367,12 +2816,14 @@ def main():
 
     tickers, pop_scores = build_universe(
         sources=args.sources,
-        max_tickers=args.max,
+        max_tickers=max_tickers,
         show=args.show_universe,
+        large=args.large_universe,
     )
 
-    data_map = fetch_price_data(tickers, skip_alpaca=args.override_alpaca)
+    data_map = fetch_price_data(tickers, skip_polygon=args.override_polygon)
     info_map = fetch_fundamentals(list(data_map.keys()))
+    enrich_short_interest(info_map)
 
     # SPY benchmark for relative-strength scoring
     bench_c = None
@@ -2468,30 +2919,28 @@ def main():
         "[dim]Educational use only. Not financial advice. Trade at your own risk.[/dim]",
         border_style="yellow"))
 
+    end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    console.print(f"\n[dim]Completed: {end_time}[/dim]")
+
 
 if __name__ == "__main__":
     main()
 
 
 '''
-Plan:
 
-what are better ways to identify momentum setups before and after the market? Looking the day before or at nighttime to see
-what options will usually be the best to ride typically to 10-15 percent in a week.
-    - Also, can we check the inflow/outflow to of a stock to see if there is a lot of institutional interest building up that could be a catalyst for a big move?
-       or just look at volume pattterns, tachnicals and so forth to proprly build something that can identify good swing trading.
-       On top of this, for premarket movers I would like to utilize the volume flow, chart trend, candle patterns, key points broken and so forth
-       to look at more than just high relative volume to determine the quality of pop, as well as identifiying where we are in the breakout process
+Now I have bought the Stocks Starter on polygon for using the api,
 
+the name and key are 
+POLYGON_NAME=
+POLYGON_KEY=
+respectively (i don't knnow if polygone_name is needed or not)
 
-What are ways to get better stocks that I can utilize for swing trading, additionally, I have a free paper trading account on alpaca, is it possible
-to switch to that for better data and execution?
+Now instead of using yfinance and alpaca, I want to use polygon api for fetching the data, can you please modify the code accordingly?
+- if I use yfinacne or aplaca for retrieving tickers for the universe that is fine
 
+Polygon should be used for fetching all the data we use for calculating, and additionally see what more it can do
 
-Where can I get more stocks that are good quality yet volitile safely enough for sqing trading? I am using stocktwits as of now but wnat to see
-where else we can get quality with fundamentals yet innovative enough to have good swings. I want to be able to find stocks that have good fundamentals but are 
-also good enough to swing trade, ideally with some catalyst or momentum behind them in the early stages prior to when moved heavily up. I also want to be able to identify 
-when a stock is in a good position to swing trade, such as being near a key support or resistance level, or having a strong trend.
+Also I would like ot have this as a dashboard too.
 
-Where could I get those?
 '''
