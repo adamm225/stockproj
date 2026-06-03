@@ -595,6 +595,128 @@ def fetch_yahoo_movers(top_n: int = 50) -> dict:
 
 
 # ──────────────────────────────────────────────
+#  WEBULL + ROBINHOOD  (retail-popularity universe sources)
+# ──────────────────────────────────────────────
+
+def fetch_webull_actives(max_tickers: int = 400) -> dict:
+    """
+    Scrape Webull US 'most active' via a headless browser running in the
+    background (no visible window). Webull renders a *virtualized* list — only
+    ~50 rows live in the DOM at once and scrolling recycles them — so we
+    intercept the JSON API responses (which carry "disSymbol") as we scroll;
+    each scroll makes Webull fetch the next batch.
+
+    Returns {ticker: score} scored by volume rank (earlier = higher score).
+    Requires:  pip install playwright  &&  playwright install chromium
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        console.print("  [yellow]⚠ Webull: Playwright not installed — skipping. "
+                      "Run: pip install playwright && playwright install chromium[/yellow]")
+        return {}
+
+    captured = []  # symbols in API-arrival order (== volume rank)
+
+    def handle_response(response):
+        try:
+            if "json" not in response.headers.get("content-type", ""):
+                return
+            body = response.text()
+            if "disSymbol" not in body and '"symbol"' not in body:
+                return
+            for m in re.finditer(r'"(?:disSymbol|symbol|tickerSymbol)"\s*:\s*"([A-Z.]{1,6})"', body):
+                sym = m.group(1).upper().split(".")[0]
+                if 1 <= len(sym) <= 5 and sym.isalpha() and sym not in TICKER_BLACKLIST:
+                    captured.append(sym)
+        except Exception:
+            pass
+
+    results = {}
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True,
+                                        args=["--no-sandbox", "--disable-dev-shm-usage"])
+            page = browser.new_page(
+                user_agent=random.choice(_UA_POOL),
+                viewport={"width": 1920, "height": 1080},
+            )
+            page.on("response", handle_response)
+            page.goto("https://www.webull.com/quote/us/actives/",
+                      wait_until="domcontentloaded", timeout=60000)
+            try:
+                page.wait_for_selector("table tr", timeout=30000)
+            except Exception:
+                pass
+            time.sleep(3)
+
+            last_len, stagnant = 0, 0
+            for _ in range(40):
+                page.mouse.wheel(0, 3000)
+                time.sleep(0.7)
+                uniq = len(dict.fromkeys(captured))
+                if uniq == last_len:
+                    stagnant += 1
+                    if stagnant >= 5:
+                        break
+                else:
+                    stagnant = 0
+                last_len = uniq
+                if uniq >= max_tickers:
+                    break
+            browser.close()
+
+        ordered = list(dict.fromkeys(captured))[:max_tickers]
+        for rank, sym in enumerate(ordered):
+            results[sym] = len(ordered) - rank   # rank-1 = highest score
+
+        if results:
+            console.print(f"  [green]✔ Webull actives: {len(results)} tickers[/green]")
+        else:
+            console.print("  [yellow]⚠ Webull: 0 tickers captured[/yellow]")
+    except Exception as e:
+        console.print(f"  [yellow]⚠ Webull failed: {str(e)[:80]}[/yellow]")
+
+    return results
+
+
+def fetch_robinhood_popular(top_n: int = 100) -> dict:
+    """
+    Scrape stockscan.io's 'Robinhood popular' list (top 100 retail holdings).
+    Tickers live in href links like /stocks/TSLA, so a plain request works.
+
+    Returns {ticker: score} scored by list position (earlier = higher score).
+    """
+    from bs4 import BeautifulSoup
+    results = {}
+    try:
+        r = requests.get("https://stockscan.io/100-popular-stocks-robinhood",
+                         headers={"User-Agent": random.choice(_UA_POOL)}, timeout=15)
+        soup = BeautifulSoup(r.text, "lxml")
+
+        ordered = []
+        for a in soup.find_all("a", href=True):
+            m = re.search(r'/stocks?/([A-Z]{1,5})(?:/|$|\?)', a["href"], re.I)
+            if m:
+                sym = m.group(1).upper()
+                if sym.isalpha() and sym not in TICKER_BLACKLIST:
+                    ordered.append(sym)
+
+        ordered = list(dict.fromkeys(ordered))[:top_n]
+        for rank, sym in enumerate(ordered):
+            results[sym] = len(ordered) - rank
+
+        if results:
+            console.print(f"  [green]✔ Robinhood popular: {len(results)} tickers[/green]")
+        else:
+            console.print("  [yellow]⚠ Robinhood: 0 tickers found[/yellow]")
+    except Exception as e:
+        console.print(f"  [yellow]⚠ Robinhood failed: {str(e)[:80]}[/yellow]")
+
+    return results
+
+
+# ──────────────────────────────────────────────
 #  REDDIT
 # ──────────────────────────────────────────────
 
@@ -1210,64 +1332,69 @@ def build_universe(sources: list, max_tickers: int = 500, show: bool = False,
         quality_topn, quality_pages = 200, 3
         moment_topn, moment_pages   = 200, 5
 
+    # ── Build the list of independent source fetches, then run them all
+    # concurrently. Each is network/IO-bound, so threads give a big speedup
+    # over the old sequential calls. Each task returns its own {ticker: score}
+    # dict; we apply the per-source weight when merging after they complete.
+    #   tasks[name] = (callable, weight, log_label)
+    tasks = {}
+
     if "finviz" in sources:
-        console.print("[cyan]📊 Finviz active/volume/gainer feeds...[/cyan]")
-        fv = fetch_finviz_active(top_n=active_topn, max_pages=active_pages)
-        if fv:
-            finviz_hit = True
-            for t, s in fv.items():
-                combined[t] += s * 1.2
-        else:
-            console.print("  [yellow]⚠ Finviz returned 0 tickers — adding NASDAQ FTP fallback[/yellow]")
-            for t, s in fetch_nasdaq_ftp().items():
-                combined[t] += s
-
-        console.print("[cyan]📰 Finviz news trending...[/cyan]")
-        for t, s in fetch_finviz_trending().items():
-            combined[t] += s
-
+        tasks["finviz_active"]   = (lambda: fetch_finviz_active(top_n=active_topn, max_pages=active_pages),
+                                    1.2, "Finviz active/volume/gainer feeds")
+        tasks["finviz_trending"] = (fetch_finviz_trending, 1.0, "Finviz news trending")
     if "yahoo" in sources:
-        console.print("[cyan]📈 Yahoo Finance screener feeds...[/cyan]")
-        for t, s in fetch_yahoo_screens().items():
-            combined[t] += s
-
-        console.print("[cyan]🔥 Yahoo Finance real-time movers...[/cyan]")
-        for t, s in fetch_yahoo_movers().items():
-            combined[t] += s * 1.5
-
-    console.print("[cyan]💬 StockTwits sentiment (trending + suggested + per-symbol)...[/cyan]")
-    for t, s in fetch_stocktwits_sentiment().items():
-        combined[t] += s * 1.3
-
+        tasks["yahoo_screens"]   = (fetch_yahoo_screens, 1.0, "Yahoo screener feeds")
+        tasks["yahoo_movers"]    = (fetch_yahoo_movers, 1.5, "Yahoo real-time movers")
+    # StockTwits always contributes sentiment
+    tasks["stocktwits"]          = (fetch_stocktwits_sentiment, 1.3, "StockTwits sentiment")
+    if "webull" in sources:
+        tasks["webull"]          = (fetch_webull_actives, 1.4, "Webull actives (headless)")
+    if "robinhood" in sources:
+        tasks["robinhood"]       = (fetch_robinhood_popular, 1.4, "Robinhood popular (stockscan)")
     if "movers" in sources:
-        console.print("[cyan]🔥 Polygon gainers/losers snapshot...[/cyan]")
-        for t, s in fetch_polygon_movers().items():
-            combined[t] += s * 1.5
-
+        tasks["polygon_movers"]  = (fetch_polygon_movers, 1.5, "Polygon gainers/losers")
     if "reddit" in sources:
-        console.print("[cyan]🤖 Reddit WSB + stocks mention scraper...[/cyan]")
-        for t, s in fetch_reddit_mentions().items():
-            combined[t] += s * 2.0
-
+        tasks["reddit"]          = (fetch_reddit_mentions, 2.0, "Reddit WSB + stocks mentions")
     if "insider" in sources:
-        console.print("[cyan]🕵  OpenInsider cluster buys + officer purchases...[/cyan]")
-        for t, s in fetch_openinsider_clusters().items():
-            combined[t] += s * 2.2  # strongest single fundamental signal
-
+        tasks["insider"]         = (fetch_openinsider_clusters, 2.2, "OpenInsider cluster/officer buys")
     if "quality" in sources:
-        console.print("[cyan]💎 Finviz quality screen (growth + margin + near 52wH)...[/cyan]")
-        for t, s in fetch_finviz_quality(top_n=quality_topn, max_pages=quality_pages).items():
-            combined[t] += s * 1.6
-
+        tasks["quality"]         = (lambda: fetch_finviz_quality(top_n=quality_topn, max_pages=quality_pages),
+                                    1.6, "Finviz quality screen")
     if "momentum" in sources:
-        console.print("[cyan]🚀 Finviz momentum (low-float NASDAQ, relvol>1.5, vol>3%w)...[/cyan]")
-        for t, s in fetch_finviz_momentum(top_n=moment_topn, max_pages=moment_pages).items():
-            combined[t] += s * 2.0  # high-conviction setup screen for 10-15% swings
-
+        tasks["momentum"]        = (lambda: fetch_finviz_momentum(top_n=moment_topn, max_pages=moment_pages),
+                                    2.0, "Finviz momentum screen")
     if "finnhub" in sources:
-        console.print("[cyan]📅 Finnhub earnings calendar (next 30 days)...[/cyan]")
-        for t, s in fetch_finnhub_earnings_calendar().items():
-            combined[t] += s * 1.1
+        tasks["finnhub_earn"]    = (fetch_finnhub_earnings_calendar, 1.1, "Finnhub earnings calendar")
+
+    console.print(f"[cyan]⚡ Fetching {len(tasks)} universe sources in parallel...[/cyan]")
+    raw_results = {}
+    with ThreadPoolExecutor(max_workers=min(len(tasks), 8)) as ex:
+        futures = {ex.submit(fn): name for name, (fn, _w, _lbl) in tasks.items()}
+        for fut in as_completed(futures):
+            name = futures[fut]
+            label = tasks[name][2]
+            try:
+                raw_results[name] = fut.result() or {}
+            except Exception as e:
+                raw_results[name] = {}
+                console.print(f"  [yellow]⚠ {label} failed: {str(e)[:70]}[/yellow]")
+
+    # ── Merge results with per-source weights ──
+    for name, (_fn, weight, _lbl) in tasks.items():
+        res = raw_results.get(name, {})
+        if name == "finviz_active":
+            if res:
+                finviz_hit = True
+                for t, s in res.items():
+                    combined[t] += s * weight
+            else:
+                console.print("  [yellow]⚠ Finviz returned 0 tickers — adding NASDAQ FTP fallback[/yellow]")
+                for t, s in fetch_nasdaq_ftp().items():
+                    combined[t] += s
+        else:
+            for t, s in res.items():
+                combined[t] += s * weight
 
     if "nasdaq" in sources or (not combined and "finnhub" not in sources):
         console.print("[cyan]🗄  NASDAQ FTP full list (coverage fallback)...[/cyan]")
@@ -1478,6 +1605,112 @@ def fetch_polygon_movers() -> dict:
                 results[ticker] = results.get(ticker, 0) + min(chg, 30)
         console.print(f"  [green]✔ Polygon {direction}: {len(data['tickers'])} tickers[/green]")
     return results
+
+
+def fetch_polygon_premarket(tickers: list) -> dict:
+    """
+    Pull the full-market snapshot (one call) and extract live/extended-hours
+    session state for our universe:
+      pm_gap     — % change vs prior close (the premarket/live gap)
+      pm_price   — last traded price (includes pre/post-market trades)
+      pm_vol     — volume accumulated so far today (premarket volume before 9:30)
+      prev_close — prior regular-session close
+
+    Polygon's snapshot reflects extended-hours trades, so this is the piece the
+    daily bars miss. Most meaningful in the premarket (6:00–9:30 ET) and
+    after-hours windows; during the regular session it mirrors the live day bar.
+    """
+    if not POLYGON_KEY:
+        return {}
+    want    = set(tickers)
+    url     = f"{POLYGON_BASE}/v2/snapshot/locale/us/markets/stocks/tickers"
+    session = requests.Session()
+    data    = _polygon_get(session, url, {})
+    if not data or not data.get("tickers"):
+        console.print("[yellow]⚠ Polygon premarket snapshot returned 0 tickers[/yellow]")
+        return {}
+
+    result = {}
+    for obj in data["tickers"]:
+        ticker = (obj.get("ticker") or "").upper()
+        if ticker not in want:
+            continue
+        prev       = obj.get("prevDay") or {}
+        day        = obj.get("day") or {}
+        minbar     = obj.get("min") or {}
+        ltrade     = obj.get("lastTrade") or {}
+        prev_close = prev.get("c") or 0
+        pm_price   = ltrade.get("p") or minbar.get("c") or day.get("c") or 0
+        pm_vol     = day.get("v") or minbar.get("av") or 0
+        if not pm_price or not prev_close:
+            continue
+        pm_gap = obj.get("todaysChangePerc")
+        if pm_gap is None:
+            pm_gap = (pm_price - prev_close) / prev_close * 100
+        result[ticker] = {
+            "pm_gap":     float(pm_gap or 0),
+            "pm_price":   float(pm_price),
+            "pm_vol":     float(pm_vol or 0),
+            "prev_close": float(prev_close),
+        }
+    console.print(f"[green]✔ Polygon premarket snapshot: {len(result)} tickers (live gap + premarket volume)[/green]")
+    return result
+
+
+def fetch_polygon_intraday(tickers: list) -> dict:
+    """
+    Fetch 1-minute aggregate bars for the most recent trading session, used by
+    Strategy 1's intraday_phase() model.
+
+    Queries a short range (last 5 calendar days) so weekends/holidays resolve to
+    the latest session with data, then keeps only that session's bars.
+
+    Returns {ticker: DataFrame[Open,High,Low,Close,Volume]} with a DatetimeIndex.
+    Note: Stocks Starter minute data is 15-min delayed — fine for screening the
+    intraday structure, not for live order fills.
+    """
+    if not POLYGON_KEY or not tickers:
+        return {}
+
+    end_date   = datetime.now().date()
+    start_date = end_date - timedelta(days=5)
+    start, end = start_date.isoformat(), end_date.isoformat()
+    data_map   = {}
+
+    def fetch_one(session, ticker):
+        url  = f"{POLYGON_BASE}/v2/aggs/ticker/{ticker}/range/1/minute/{start}/{end}"
+        data = _polygon_get(session, url, {"adjusted": "true", "sort": "asc", "limit": 50000})
+        if not data or data.get("status") not in ("OK", "DELAYED") or not data.get("results"):
+            return ticker, None
+        rows = data["results"]
+        if len(rows) < 15:
+            return ticker, None
+        df = pd.DataFrame(rows)
+        df["timestamp"] = pd.to_datetime(df["t"], unit="ms")
+        df = df.set_index("timestamp")
+        df = df.rename(columns={"o": "Open", "h": "High", "l": "Low", "c": "Close", "v": "Volume"})
+        df = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close", "Volume"])
+        # Keep only the most recent session present in the range.
+        last_day = df.index.normalize().max()
+        df = df[df.index.normalize() == last_day]
+        return (ticker, df) if len(df) >= 15 else (ticker, None)
+
+    session = requests.Session()
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        futures = {ex.submit(fetch_one, session, t): t for t in tickers}
+        for fut in as_completed(futures):
+            try:
+                ticker, df = fut.result()
+                if df is not None:
+                    data_map[ticker] = df
+            except Exception:
+                pass
+
+    if data_map:
+        console.print(f"[green]✔ Polygon intraday: {len(data_map)}/{len(tickers)} tickers (1-min bars)[/green]")
+    else:
+        console.print("[yellow]⚠ Polygon intraday: 0 tickers (market may be pre-open)[/yellow]")
+    return data_map
 
 
 # ──────────────────────────────────────────────
@@ -1874,13 +2107,20 @@ def pivot_distance(c, h, lookback=20):
     return round((price - pivot) / pivot * 100, 1) if pivot > 0 else 0.0
 
 
-def breakout_phase(c, h, l, lookback=20, window=10):
+def breakout_phase(c, h, l, v=None, lookback=20, window=10):
     """Tag where the stock is in the breakout process.
     Base        — still under a tight pivot, primed
-    Breakout    — broke pivot in last 1-2 days (best entry)
+    Breakout    — broke pivot in last 1-2 days ON VOLUME (best entry)
+    Breakout?   — broke pivot but volume did NOT confirm (suspect — fails often)
     Continuation— 3-5 days post-breakout, holding
     Extended    — far above pivot, chasing risk
-    Failed      — broke pivot then fell back below"""
+    Failed      — broke pivot then fell back below
+
+    Volume confirmation: a genuine breakout expands volume on the breakout bar
+    vs its trailing 50-day average. An unconfirmed (low-volume) breakout is
+    statistically far more likely to fail, so it is downgraded to 'Breakout?'.
+    Pass `v` (the Volume series) to enable this; omit it for the legacy
+    price-only behavior."""
     if len(c) < lookback + window + 1:
         return "Unknown"
     pivot_series = h.iloc[-lookback-window-1:-window-1]
@@ -1900,8 +2140,19 @@ def breakout_phase(c, h, l, lookback=20, window=10):
         return "Failed"
     first_break = int(np.argmax(above_mask))   # first True index
     days_since  = (len(above_mask) - 1) - first_break
+
+    # Volume confirmation on the breakout bar (RVOL >= 1.5 vs trailing 50d avg).
+    vol_confirmed = True
+    if v is not None and len(v) == len(c):
+        brk_idx = len(c) - window + first_break   # absolute index of breakout bar
+        if 0 <= brk_idx < len(v):
+            trail = v.iloc[max(0, brk_idx - 50):brk_idx]
+            avg   = float(trail.mean()) if len(trail) else 0.0
+            brk_v = float(v.iloc[brk_idx])
+            vol_confirmed = avg > 0 and (brk_v / avg) >= 1.5
+
     if days_since <= 1:
-        return "Breakout"
+        return "Breakout" if vol_confirmed else "Breakout?"
     if days_since <= 5 and pct_above < 10:
         return "Continuation"
     return "Extended"
@@ -1929,7 +2180,7 @@ def setup_quality_score(df, bench_c, pop=0):
         stage     = weinstein_stage(c)
         pivot_d   = pivot_distance(c, h, 20)
         tightness = base_tightness(h, l, c, 10)
-        phase     = breakout_phase(c, h, l, 20, 10)
+        phase     = breakout_phase(c, h, l, v, 20, 10)
         gap_pct   = (float(o.iloc[-1]) - float(c.iloc[-2])) / float(c.iloc[-2]) * 100 if len(c) >= 2 else 0
         gap_atr   = gap_pct / atp if atp > 0 else 0
 
@@ -1943,7 +2194,7 @@ def setup_quality_score(df, bench_c, pop=0):
             "Pivot":    10 if -2 <= pivot_d <= 3 else (6 if -5 <= pivot_d < -2 else (2 if pivot_d > 5 else 0)),
             "Tight":    10 if tightness < 0.80 else (6 if tightness < 0.90 else 0),
             "GapATR":   10 if gap_atr >= 1.5 else (6 if gap_atr >= 0.8 else (3 if gap_atr > 0 else 0)),
-            "Phase":    10 if phase == "Breakout" else (8 if phase == "Continuation" else (6 if phase == "Base" else (2 if phase == "Extended" else 0))),
+            "Phase":    10 if phase == "Breakout" else (8 if phase == "Continuation" else (6 if phase == "Base" else (4 if phase == "Breakout?" else (2 if phase == "Extended" else 0)))),
             "Pop":      10 if pop > 100 else (6 if pop > 30 else (2 if pop > 5 else 0)),
         }
         raw = sum(comps.values())
@@ -1956,6 +2207,59 @@ def setup_quality_score(df, bench_c, pop=0):
         return score, phase, meta
     except Exception:
         return 0, "Unknown", {}
+
+
+def intraday_phase(df_min):
+    """Intraday phase model for low-priced catalyst/momentum names (Strategy 1).
+
+    A SEPARATE model from the daily breakout_phase: catalyst runners live on an
+    intraday timescale (gap → VWAP → run → exhaustion), not a 20-day base. Built
+    on 1-minute bars + session VWAP. Returns one of:
+      Gap&Go       — opened strong, held above VWAP, sitting high in the day's range
+      VWAP-Reclaim — spent the session below VWAP but reclaimed it and is rising
+      Parabolic    — stretched far above VWAP and pinned to highs (exhaustion risk)
+      Fade         — below VWAP and rolling over (avoid)
+      Range        — chopping around VWAP, no edge
+      Unknown      — insufficient data
+    """
+    if df_min is None or len(df_min) < 15:
+        return "Unknown"
+    try:
+        o, h, l = df_min["Open"], df_min["High"], df_min["Low"]
+        c, v    = df_min["Close"], df_min["Volume"]
+        price   = float(c.iloc[-1])
+        if price <= 0:
+            return "Unknown"
+
+        tp     = (h + l + c) / 3.0
+        cum_v  = v.cumsum()
+        vwap   = (tp * v).cumsum() / cum_v.replace(0, np.nan)
+        vw     = float(vwap.iloc[-1])
+        if not np.isfinite(vw) or vw <= 0:
+            return "Unknown"
+
+        dist   = (price - vw) / vw * 100              # % above/below VWAP
+        sess_h = float(h.max())
+        sess_l = float(l.min())
+        rng    = sess_h - sess_l
+        pos    = (price - sess_l) / rng if rng > 0 else 0.5   # position in day range
+        above_vwap_frac = float((c > vwap).mean())            # share of day above VWAP
+
+        seg    = c.iloc[-15:].values.astype(float)            # recent ~15-min slope
+        slope  = float(np.polyfit(np.arange(len(seg)), seg, 1)[0]) if len(seg) >= 5 else 0.0
+        slope_pct = slope / price * 100 if price > 0 else 0.0
+
+        if dist >= 8 and pos > 0.85:
+            return "Parabolic"
+        if dist < -1 and slope_pct < 0:
+            return "Fade"
+        if above_vwap_frac < 0.5 and dist > 0 and slope_pct >= 0:
+            return "VWAP-Reclaim"
+        if dist >= 0 and pos >= 0.55 and above_vwap_frac >= 0.5:
+            return "Gap&Go"
+        return "Range"
+    except Exception:
+        return "Unknown"
 
 
 # ──────────────────────────────────────────────
@@ -1984,17 +2288,17 @@ def _is_blocked(ticker: str, info_map: dict, strategy: int) -> bool:
 #  STRATEGY 1: HIGH RVOL / CATALYST
 # ──────────────────────────────────────────────
 
-def s1_catalyst(data_map, info_map, pop_scores, bench_c=None):
+def s1_catalyst(data_map, info_map, pop_scores, bench_c=None, premarket=None, intraday=None, relax=False):
     results = []
     for ticker, df in data_map.items():
         try:
-            if _is_blocked(ticker, info_map, 1):
+            if _is_blocked(ticker, info_map, 1) and not relax:
                 continue
             if len(df) < 20:
                 continue
             c, v, h, l, o = df["Close"], df["Volume"], df["High"], df["Low"], df["Open"]
             price = float(c.iloc[-1])
-            if not (0.50 <= price <= 10.0):
+            if not (0.50 <= price <= 10.0) and not relax:
                 continue
 
             rv      = rvol(v)
@@ -2011,6 +2315,8 @@ def s1_catalyst(data_map, info_map, pop_scores, bench_c=None):
             rng     = float(h.iloc[-1]) - float(l.iloc[-1])
             body_r  = body / rng if rng > 0 else 0
             pop     = pop_scores.get(ticker, 0)
+            pm      = (premarket or {}).get(ticker)
+            iphase  = intraday_phase((intraday or {}).get(ticker))
 
             sigs = {
                 "rvol":        1.0 if rv >= 2.5 else (0.5 if rv >= 1.5 else 0.0),
@@ -2025,11 +2331,34 @@ def s1_catalyst(data_map, info_map, pop_scores, bench_c=None):
                 "popular":     1.0 if pop > 100 else (0.5 if pop > 20 else 0.0),
             }
 
+            # Premarket / live catalyst confirmation — only scored when a snapshot
+            # exists (markets open). Avoids penalizing runs after hours/weekends.
+            if pm:
+                v20pm      = float(v.iloc[-21:-1].mean())
+                pm_relvol  = pm["pm_vol"] / v20pm if v20pm > 0 else 0
+                sigs["pm_gap"]    = 1.0 if pm["pm_gap"] >= 4 else (0.5 if pm["pm_gap"] >= 1.5 else 0.0)
+                sigs["pm_volume"] = 1.0 if pm_relvol >= 0.30 else (0.5 if pm_relvol >= 0.10 else 0.0)
+
+            # Intraday structure (only scored when 1-min bars exist): reward names
+            # holding above VWAP (Gap&Go / reclaim), penalize fades/parabolic chases.
+            if iphase != "Unknown":
+                sigs["intraday"] = {
+                    "Gap&Go":       1.0,
+                    "VWAP-Reclaim": 1.0,
+                    "Range":        0.5,
+                    "Parabolic":    0.3,
+                    "Fade":         0.0,
+                }.get(iphase, 0.0)
+
             conf   = sig_score(sigs)
-            if conf < 40:
+            if conf < 40 and not relax:
                 continue
 
             setupq, phase, _meta = setup_quality_score(df, bench_c, pop)
+            # S1 is an intraday catalyst regime — prefer the intraday phase tag
+            # over the daily-swing breakout_phase when minute bars are available.
+            if iphase != "Unknown":
+                phase = iphase
             info   = info_map.get(ticker, {})
             catq   = catalyst_quality_score(info, c, h, l, o, v, bench_c, rv, price)
 
@@ -2044,6 +2373,7 @@ def s1_catalyst(data_map, info_map, pop_scores, bench_c=None):
 
             results.append(dict(
                 Ticker=ticker, Price=f"${price:.2f}", RVOL=f"{rv}x",
+                PM_Gap=f"{pm['pm_gap']:+.1f}%" if pm else "—",
                 DayChg=f"{day_chg:+.1f}%", RSI=round(r, 1),
                 ATR_pct=f"{atp:.1f}%", Cap=cap_lbl,
                 Phase=phase, SetupQ=setupq, CatQ=catq,
@@ -2065,17 +2395,17 @@ def s1_catalyst(data_map, info_map, pop_scores, bench_c=None):
 #  STRATEGY 2: MOMENTUM SWING
 # ──────────────────────────────────────────────
 
-def s2_swing(data_map, info_map, pop_scores, bench_c=None):
+def s2_swing(data_map, info_map, pop_scores, bench_c=None, premarket=None, relax=False):
     results = []
     for ticker, df in data_map.items():
         try:
-            if _is_blocked(ticker, info_map, 2):
+            if _is_blocked(ticker, info_map, 2) and not relax:
                 continue
             if len(df) < 55:
                 continue
             c, v, h, l = df["Close"], df["Volume"], df["High"], df["Low"]
             price = float(c.iloc[-1])
-            if price < 5:
+            if price < 5 and not relax:
                 continue
 
             e20  = float(ema(c, 20).iloc[-1])
@@ -2092,6 +2422,7 @@ def s2_swing(data_map, info_map, pop_scores, bench_c=None):
             m3m  = (float(c.iloc[-1]) - float(c.iloc[-63])) / float(c.iloc[-63]) * 100 if len(c) >= 63 else 0
             vol_rising = float(v.iloc[-5:].mean()) > float(v.iloc[-20:-5].mean())
             pop  = pop_scores.get(ticker, 0)
+            pm   = (premarket or {}).get(ticker)
 
             info    = info_map.get(ticker, {})
             rev_g   = info.get("revenueGrowth", None)
@@ -2116,8 +2447,12 @@ def s2_swing(data_map, info_map, pop_scores, bench_c=None):
                 "popular":    1.0 if pop > 50 else (0.5 if pop > 10 else 0.0),
             }
 
+            # Live premarket strength — confirms the swing isn't gapping down today.
+            if pm:
+                sigs["pm_strength"] = 1.0 if pm["pm_gap"] >= 1 else (0.0 if pm["pm_gap"] <= -2 else 0.5)
+
             conf = sig_score(sigs)
-            if conf < 45:
+            if conf < 45 and not relax:
                 continue
 
             setupq, phase, _meta = setup_quality_score(df, bench_c, pop)
@@ -2132,6 +2467,7 @@ def s2_swing(data_map, info_map, pop_scores, bench_c=None):
                 vsEMA20=f"{((price/e20)-1)*100:+.1f}%",
                 vsEMA50=f"{((price/e50)-1)*100:+.1f}%",
                 Mom1M=f"{m1m:+.1f}%", Mom3M=f"{m3m:+.1f}%",
+                PM_Gap=f"{pm['pm_gap']:+.1f}%" if pm else "—",
                 UpDnVol=f"{uvr}x",
                 HH_HL="✅" if (hh and hl) else ("⚠️" if (hh or hl) else "❌"),
                 Phase=phase, SetupQ=setupq,
@@ -2153,17 +2489,17 @@ def s2_swing(data_map, info_map, pop_scores, bench_c=None):
 #  STRATEGY 3: GAP & BREAKOUT
 # ──────────────────────────────────────────────
 
-def s3_breakout(data_map, info_map, pop_scores, bench_c=None):
+def s3_breakout(data_map, info_map, pop_scores, bench_c=None, premarket=None, relax=False):
     results = []
     for ticker, df in data_map.items():
         try:
-            if _is_blocked(ticker, info_map, 3):
+            if _is_blocked(ticker, info_map, 3) and not relax:
                 continue
             if len(df) < 30:
                 continue
             c, v, h, l, o = df["Close"], df["Volume"], df["High"], df["Low"], df["Open"]
             price   = float(c.iloc[-1])
-            if price < 1:
+            if price < 1 and not relax:
                 continue
 
             gap_pct = (float(o.iloc[-1]) - float(c.iloc[-2])) / float(c.iloc[-2]) * 100
@@ -2182,6 +2518,7 @@ def s3_breakout(data_map, info_map, pop_scores, bench_c=None):
             rng_c   = float(h.iloc[-1]) - float(l.iloc[-1])
             body_r  = body / rng_c if rng_c > 0 else 0
             pop     = pop_scores.get(ticker, 0)
+            pm      = (premarket or {}).get(ticker)
 
             sigs = {
                 "gap_up":       1.0 if gap_pct >= 3 else (0.5 if gap_pct >= 1 else 0.0),
@@ -2197,8 +2534,16 @@ def s3_breakout(data_map, info_map, pop_scores, bench_c=None):
                 "popular":      1.0 if pop > 80 else (0.5 if pop > 20 else 0.0),
             }
 
+            # Live premarket gap + volume — the breakout's freshest confirmation,
+            # which the prior daily bar can't see. Scored only when a snapshot exists.
+            if pm:
+                v20pm     = float(v.iloc[-21:-1].mean())
+                pm_relvol = pm["pm_vol"] / v20pm if v20pm > 0 else 0
+                sigs["pm_gap"]    = 1.0 if pm["pm_gap"] >= 3 else (0.5 if pm["pm_gap"] >= 1 else 0.0)
+                sigs["pm_volume"] = 1.0 if pm_relvol >= 0.25 else (0.5 if pm_relvol >= 0.08 else 0.0)
+
             conf   = sig_score(sigs)
-            if conf < 42:
+            if conf < 42 and not relax:
                 continue
 
             setupq, phase, _meta = setup_quality_score(df, bench_c, pop)
@@ -2216,7 +2561,9 @@ def s3_breakout(data_map, info_map, pop_scores, bench_c=None):
 
             results.append(dict(
                 Ticker=ticker, Price=f"${price:.2f}",
-                Gap=f"{gap_pct:+.1f}%", RVOL=f"{rv}x",
+                Gap=f"{gap_pct:+.1f}%",
+                PM_Gap=f"{pm['pm_gap']:+.1f}%" if pm else "—",
+                RVOL=f"{rv}x",
                 RSI=round(r, 1), DayChg=f"{day_chg:+.1f}%",
                 FlatBase="✅" if flat else "—",
                 H52Break="✅" if price >= h52*0.97 else "—",
@@ -2236,92 +2583,194 @@ def s3_breakout(data_map, info_map, pop_scores, bench_c=None):
 
 
 # ──────────────────────────────────────────────
-#  STRATEGY 4: EARNINGS VOLATILITY SETUP
+#  STRATEGY 4: QUALITY COMPOUNDER  (4–6 month hold)
+#
+#  Replaces the old earnings-volatility setup. Hunts for *good companies* in
+#  confirmed uptrends that you can hold for a season, not a day: consistent
+#  growth (the "catalyst" is the business itself), healthy margins/ROE/cash
+#  flow, sane valuation, analyst support, insider/institutional backing — with
+#  realistic (not explosive) volatility and genuine liquidity. The opposite
+#  end of the risk spectrum from Strategy 1.
 # ──────────────────────────────────────────────
 
-def s4_earnings_setup(data_map, info_map, pop_scores):
+def _fmt_pct(x, signed=False, scale=100.0):
+    """Format a fraction (0.12 → '12%') for display, or '—' when missing."""
+    if x is None:
+        return "—"
+    try:
+        v = float(x) * scale
+    except (TypeError, ValueError):
+        return "—"
+    return f"{v:+.0f}%" if signed else f"{v:.0f}%"
+
+
+def _analyst_view(info, price):
+    """Pull yfinance analyst consensus into (label, mean, n_analysts, upside%, target).
+    recommendationMean is 1.0 (Strong Buy) → 5.0 (Strong Sell)."""
+    mean = info.get("recommendationMean")
+    n    = int(info.get("numberOfAnalystOpinions") or 0)
+    key  = (info.get("recommendationKey") or "").replace("_", " ").title() or "—"
+    tgt  = info.get("targetMeanPrice") or info.get("targetMedianPrice")
+    upside = (float(tgt) - price) / price * 100 if (tgt and price > 0) else None
+    label = f"{key}({mean:.1f})" if isinstance(mean, (int, float)) else key
+    return label, mean, n, upside, (float(tgt) if tgt else None)
+
+
+def s4_quality_compounder(data_map, info_map, pop_scores, bench_c=None, relax=False):
+    """4–6 month positional holds: quality businesses in Stage-2 uptrends with
+    consistent growth, analyst support, and realistic volatility."""
     results = []
     for ticker, df in data_map.items():
         try:
-            if _is_blocked(ticker, info_map, 4):
+            if _is_blocked(ticker, info_map, 4) and not relax:
                 continue
-            if len(df) < 20:
+            if len(df) < 130:          # need ~6 months of history for the trend/momentum reads
                 continue
             c, v, h, l = df["Close"], df["Volume"], df["High"], df["Low"]
             price = float(c.iloc[-1])
-            if price < 1:
-                continue
 
-            info     = info_map.get(ticker, {})
-            earn_date = None
-            try:
-                t_obj = yf.Ticker(ticker)
-                cal   = t_obj.calendar
-                if cal is not None and not cal.empty:
-                    if "Earnings Date" in cal.columns:
-                        earn_date = pd.to_datetime(cal["Earnings Date"].iloc[0])
-                    elif hasattr(cal, "T") and "Earnings Date" in cal.T.columns:
-                        earn_date = pd.to_datetime(cal.T["Earnings Date"].iloc[0])
-            except Exception:
-                pass
+            # ── Gate: real company, real liquidity — but room for smaller, livelier
+            #    growth names. We want *some* risk here, not just sleepy mega-caps. ──
+            info       = info_map.get(ticker, {})
+            cap        = info.get("marketCap", 0) or 0
+            avg_vol    = float(v.iloc[-21:-1].mean())
+            dollar_vol = price * avg_vol
+            if not relax:
+                if price < 5:                 continue   # contrasts with S1's <$10 band
+                if cap < 300e6:               continue   # small-cap+ allowed → more upside/volatility
+                if dollar_vol < 3e6:          continue   # ≥ $3M/day traded = still exitable
+                # Decent-business floor (NOT a profitability mandate): only drop names
+                # whose top line is actively shrinking. Unprofitable fast growers stay.
+                _rg = info.get("revenueGrowth")
+                if _rg is not None and _rg < -0.10:
+                    continue
 
-            if earn_date is None:
-                continue
-            et_tz  = pytz.timezone("America/New_York")
-            now_et = datetime.now(et_tz)
-            earn_dt = earn_date if earn_date.tzinfo else et_tz.localize(earn_date)
-            days_to = (earn_dt.date() - now_et.date()).days
-            if not (0 <= days_to <= 3):
-                continue
-
-            e20    = float(ema(c, 20).iloc[-1])
+            # ── Trend / momentum (the "is it working?" half) ──
             e50    = float(ema(c, 50).iloc[-1])
+            e200   = float(ema(c, 200).iloc[-1]) if len(c) >= 200 else e50
             r      = rsi(c)
-            a      = atr(h, l, c)
-            atp    = (a / price) * 100
-            rv     = rvol(v)
-            m1m    = (float(c.iloc[-1]) - float(c.iloc[-22])) / float(c.iloc[-22]) * 100 if len(c) >= 22 else 0
+            stage  = weinstein_stage(c)
+            m3m    = (price / float(c.iloc[-63])  - 1) * 100 if len(c) >= 63  else 0.0
+            m6m    = (price / float(c.iloc[-126]) - 1) * 100 if len(c) >= 126 else 0.0
+            rs     = rs_vs_benchmark(c, bench_c, periods=(63, 126))   # medium-term relative strength
+            ext50  = (price / e50 - 1) * 100                          # how stretched above the 50d
             h52    = float(h.rolling(252).max().iloc[-1]) if len(h) >= 252 else float(h.max())
-            range_5d   = (float(h.iloc[-5:].max()) - float(l.iloc[-5:].min())) / price * 100
-            compressed = range_5d < 6.0
-            eps_surprise = info.get("earningsQuarterlyGrowth", None)
-            fwd_eps      = info.get("forwardEps", None)
-            rev_growth   = info.get("revenueGrowth", None)
-            beat_history = 1.0 if (eps_surprise and eps_surprise > 0.05) else 0.0
-            trending_into = price > e20 > e50 and r > 52 and m1m > 5
-            play_type = "📈 Momentum into earnings" if trending_into else ("📉 IV crush / sell spike" if compressed else "⚠️ Speculative")
+            l52    = float(l.rolling(252).min().iloc[-1]) if len(l) >= 252 else float(l.min())
+            pos52  = (price - l52) / (h52 - l52) * 100 if h52 > l52 else 50.0
+            obvs   = obv_slope(c, v, 40)                              # 40d accumulation slope
+
+            # ── Fundamentals (the "is it a good business?" half) ──
+            rev_g   = info.get("revenueGrowth")
+            earn_g  = info.get("earningsGrowth") or info.get("earningsQuarterlyGrowth")
+            margin  = info.get("profitMargins")
+            roe     = info.get("returnOnEquity")
+            d2e     = info.get("debtToEquity")          # yfinance reports this as a percent (80 ⇒ 0.8×)
+            fcf     = info.get("freeCashflow")
+            peg     = info.get("pegRatio")
+            fpe     = info.get("forwardPE") or info.get("trailingPE")
+            beta    = info.get("beta")
+            inst    = info.get("heldPercentInstitutions")
+            insider = info.get("heldPercentInsiders")
+            short_f = info.get("shortPercentOfFloat")
+
+            label, rmean, n_an, upside, a_target = _analyst_view(info, price)
+
+            # Fundamental quality sub-score (0–100), shown as its own column.
+            # "Decent, not strict": profitability is a *plus*, never a hard zero, so a
+            # reinvesting hyper-grower (negative FCF/ROE) still earns a respectable floor.
+            fund = {
+                "rev_growth":  1.0 if (rev_g  and rev_g  > 0.25) else (0.6 if (rev_g  and rev_g  > 0.10) else (0.3 if (rev_g and rev_g > 0)  else 0.0)),
+                "earn_growth": 1.0 if (earn_g and earn_g > 0.20) else (0.6 if (earn_g and earn_g > 0.0)  else (0.3 if earn_g is None      else 0.1)),
+                "margins":     1.0 if (margin and margin > 0.12) else (0.6 if (margin and margin > 0.0)  else 0.3),
+                "roe":         1.0 if (roe    and roe    > 0.15) else (0.6 if (roe    and roe    > 0.05) else 0.3),
+                "balance":     1.0 if (d2e is not None and d2e < 100) else (0.6 if (d2e is not None and d2e < 200) else (0.4 if d2e is None else 0.2)),
+                "cash_flow":   1.0 if (fcf and fcf > 0) else 0.3,
+                "valuation":   1.0 if (peg and 0 < peg <= 1.5) else (0.7 if (peg and peg <= 2.5) else (0.5 if (fpe and 0 < fpe <= 50) else (0.4 if (peg is None and fpe is None) else 0.2))),
+            }
+            quality_q = sig_score(fund)
+
+            # Consistent catalyst = the growth is broad-based (both top- and bottom-line).
+            consistent = bool(rev_g and rev_g > 0.05 and earn_g and earn_g > 0)
 
             sigs = {
-                "earnings_soon":    1.0,
-                "above_e20":        1.0 if price > e20 else 0.0,
-                "rsi_healthy":      1.0 if 45 <= r <= 72 else 0.0,
-                "positive_1m_mom":  1.0 if m1m > 3 else 0.0,
-                "near_52w_high":    1.0 if price >= h52 * 0.88 else 0.0,
-                "compressed_range": 1.0 if compressed else 0.0,
-                "beat_history":     beat_history,
-                "positive_fwd_eps": 1.0 if (fwd_eps and fwd_eps > 0) else 0.0,
-                "rev_growth":       1.0 if (rev_growth and rev_growth > 0.05) else 0.0,
-                "popular":          1.0 if pop_scores.get(ticker, 0) > 30 else 0.0,
+                # Trend / structure
+                "stage2":        1.0 if stage == "Stage2" else (0.4 if stage == "Stage1" else 0.0),
+                "above_e200":    1.0 if price > e200 else 0.0,
+                "ema_stack":     1.0 if e50 > e200 else 0.0,
+                "good_entry":    1.0 if 0 <= ext50 <= 15 else (0.5 if -8 <= ext50 < 0 else (0.2 if ext50 > 30 else 0.4)),
+                "rsi_room":      1.0 if 45 <= r <= 72 else (0.6 if (40 <= r < 45 or 72 < r <= 80) else 0.2),
+                # Momentum / risk-on — more signals here = more weight on "it's moving"
+                "mom_3m":        1.0 if 8 <= m3m <= 70 else (0.5 if 0 < m3m < 8 else 0.0),
+                "mom_6m":        1.0 if 15 <= m6m <= 120 else (0.6 if 0 < m6m < 15 else 0.0),
+                "rs_leader":     (1.0 if rs > 8 else (0.7 if rs > 0 else 0.0)) if rs is not None else 0.4,
+                "accumulation":  1.0 if obvs > 0.2 else (0.5 if obvs > 0 else 0.0),
+                "near_highs":    1.0 if pos52 >= 60 else (0.5 if pos52 >= 40 else 0.0),
+                # Growth / high-potential — the upside tilt (rewards explosive growers)
+                "rev_growth":    fund["rev_growth"],
+                "earn_growth":   fund["earn_growth"],
+                "hypergrowth":   1.0 if ((rev_g and rev_g > 0.35) or (earn_g and earn_g > 0.40)) else (0.5 if (rev_g and rev_g > 0.20) else 0.0),
+                "consistent":    1.0 if consistent else 0.0,
+                # Decent-business floor (forgiving — see `fund`)
+                "margins":       fund["margins"],
+                "roe":           fund["roe"],
+                "balance":       fund["balance"],
+                "valuation":     fund["valuation"],
+                # Conviction / sponsorship
+                "analyst_buy":   (1.0 if rmean <= 2.0 else (0.6 if rmean <= 2.5 else (0.3 if rmean <= 3.0 else 0.0))) if isinstance(rmean, (int, float)) else 0.3,
+                "analyst_upside":(1.0 if upside > 20 else (0.7 if upside > 8 else (0.4 if upside > 0 else 0.0))) if upside is not None else 0.3,
+                "coverage":      1.0 if n_an >= 5 else (0.5 if n_an >= 2 else 0.0),
+                "institutional": 1.0 if (inst and 0.40 <= inst <= 0.95) else (0.5 if (inst and inst > 0) else 0.0),
+                "insider_skin":  1.0 if (insider and insider > 0.05) else (0.5 if (insider and insider > 0.01) else 0.0),
+                # Volatility is WELCOME here — reward tradeable movement, don't punish it
+                "tradeable_vol": 1.0 if (beta and 1.0 <= beta <= 2.2) else (0.7 if (beta and 0.7 <= beta < 1.0) else (0.5 if (beta and beta > 2.2) else (0.4 if beta else 0.4))),
             }
 
             conf = sig_score(sigs)
-            if conf < 40:
+            if conf < 50 and not relax:
                 continue
 
-            exp_move = round(atp * 2.5, 1)
-            target   = round(price * (1 + exp_move / 100), 2)
-            stop     = round(price * (1 - atp / 100 * 1.2), 2)
-            industry = info.get("industry", "—")
-            country = info.get("country", "—")
+            # ── Best-effort next-earnings date (only for names that already qualify,
+            #     so we make very few network calls). A near catalyst is a small plus. ──
+            earn_in = None
+            if not relax:
+                try:
+                    cal = yf.Ticker(ticker).calendar
+                    ed  = None
+                    if cal is not None and not getattr(cal, "empty", True):
+                        if "Earnings Date" in cal.columns:
+                            ed = pd.to_datetime(cal["Earnings Date"].iloc[0])
+                        elif hasattr(cal, "T") and "Earnings Date" in cal.T.columns:
+                            ed = pd.to_datetime(cal.T["Earnings Date"].iloc[0])
+                    if ed is not None:
+                        earn_in = (ed.date() - datetime.now().date()).days
+                except Exception:
+                    pass
+
+            # Target blends analyst consensus with a momentum-implied move. Cap is
+            # wider than a sleepy compounder's — these can run, and we want the upside.
+            mom_target = price * (1 + max(0.12, min(0.60, m6m / 100 * 0.6 + 0.15)))
+            target     = round((a_target + mom_target) / 2, 2) if a_target else round(mom_target, 2)
+            tgt_pct    = (target / price - 1) * 100
+            stop       = round(min(e50, price * 0.85), 2)   # ride the 50d / give it room to breathe
+
+            cap_lbl = ("Mega" if cap >= 200e9 else "Large" if cap >= 10e9
+                       else "Mid" if cap >= 2e9 else "Small")
+            sector  = (info.get("sector") or "—")[:14]
 
             results.append(dict(
-                Ticker=ticker, Price=f"${price:.2f}", EarnIn=f"{days_to}d",
-                PlayType=play_type, RSI=round(r, 1), Mom1M=f"{m1m:+.1f}%",
-                Range5D=f"{range_5d:.1f}%", RVOL=f"{rv}x",
-                ExpMove=f"±{exp_move}%", Target=f"${target}", Stop=f"${stop}",
-                PopScore=round(pop_scores.get(ticker, 0)),
-                Confidence=conf, Industry=industry, Country=country,
-                _score=conf,
+                Ticker=ticker, Price=f"${price:.2f}", Cap=cap_lbl, Sector=sector,
+                RevGr=_fmt_pct(rev_g, signed=True), EarnGr=_fmt_pct(earn_g, signed=True),
+                NetMgn=_fmt_pct(margin), ROE=_fmt_pct(roe), PEG=(f"{peg:.1f}" if peg else "—"),
+                Rating=label, Upside=(f"{upside:+.0f}%" if upside is not None else "—"),
+                Analysts=n_an, Insider=_fmt_pct(insider), Inst=_fmt_pct(inst),
+                ShortFlt=_fmt_pct(short_f), Beta=(f"{beta:.2f}" if beta else "—"),
+                Trend=("Stage2" if stage == "Stage2" else ("Up" if price > e200 else "Weak")),
+                Mom3M=f"{m3m:+.0f}%", Mom6M=f"{m6m:+.0f}%",
+                RS=(f"{rs:+.0f}" if rs is not None else "—"),
+                Pos52=f"{pos52:.0f}%", QualityQ=quality_q,
+                EarnIn=(f"{earn_in}d" if earn_in is not None else "—"),
+                Target=f"${target}(+{tgt_pct:.0f}%)", Stop=f"${stop}", Timeframe="4–6 mo",
+                Confidence=conf, _score=(conf * 0.8 + quality_q * 0.2),
             ))
         except Exception:
             continue
@@ -2335,24 +2784,24 @@ def s4_earnings_setup(data_map, info_map, pop_scores):
 #  STRATEGY 5: OVERSOLD REVERSAL HUNTER
 # ──────────────────────────────────────────────
 
-def s5_oversold_reversal(data_map, info_map, pop_scores):
+def s5_oversold_reversal(data_map, info_map, pop_scores, relax=False):
     results = []
     for ticker, df in data_map.items():
         try:
-            if _is_blocked(ticker, info_map, 5):
+            if _is_blocked(ticker, info_map, 5) and not relax:
                 continue
             if len(df) < 40:
                 continue
             c, v, h, l, o = df["Close"], df["Volume"], df["High"], df["Low"], df["Open"]
             price = float(c.iloc[-1])
-            if price < 2:
+            if price < 2 and not relax:
                 continue
 
             # — was it oversold? (gate: currently OR within last 10 days)
             r_ser = rsi_series(c)
             r = float(r_ser.iloc[-1])
             rsi_min_10d = float(r_ser.iloc[-10:].min()) if len(r_ser) >= 10 else r
-            if not (r < 40 or rsi_min_10d < 32):
+            if not (r < 40 or rsi_min_10d < 32) and not relax:
                 continue
 
             a    = atr(h, l, c)
@@ -2402,7 +2851,7 @@ def s5_oversold_reversal(data_map, info_map, pop_scores):
             }
             rev_count = sum(1 for x in reversal_flags.values() if x)
             # — hard gate: must show proven movement, not just oversold
-            if rev_count < 2:
+            if rev_count < 2 and not relax:
                 continue
 
             info    = info_map.get(ticker, {})
@@ -2433,7 +2882,7 @@ def s5_oversold_reversal(data_map, info_map, pop_scores):
             }
 
             conf = sig_score(sigs)
-            if conf < 42:
+            if conf < 42 and not relax:
                 continue
 
             target     = round(max(e20, price * (1 + atp / 100 * 1.5)), 2)
@@ -2485,7 +2934,7 @@ SECTOR_ETFS = {
     "ARK Innovation":   "ARKK",
 }
 
-def s6_sector_rotation(data_map, info_map, pop_scores):
+def s6_sector_rotation(data_map, info_map, pop_scores, relax=False):
     sector_scores = {}
     sector_data   = {}
     for sector_name, etf_ticker in SECTOR_ETFS.items():
@@ -2527,7 +2976,7 @@ def s6_sector_rotation(data_map, info_map, pop_scores):
     results = []
     for ticker, df in data_map.items():
         try:
-            if _is_blocked(ticker, info_map, 6):
+            if _is_blocked(ticker, info_map, 6) and not relax:
                 continue
             info   = info_map.get(ticker, {})
             sector = info.get("sector", "")
@@ -2541,13 +2990,13 @@ def s6_sector_rotation(data_map, info_map, pop_scores):
                 "Utilities": "Utilities",
             }
             mapped = sector_map.get(sector, sector)
-            if mapped not in top_sectors:
+            if mapped not in top_sectors and not relax:
                 continue
             if len(df) < 30:
                 continue
             c, v, h, l = df["Close"], df["Volume"], df["High"], df["Low"]
             price = float(c.iloc[-1])
-            if price < 2:
+            if price < 2 and not relax:
                 continue
 
             e20  = float(ema(c, 20).iloc[-1])
@@ -2573,7 +3022,7 @@ def s6_sector_rotation(data_map, info_map, pop_scores):
             }
 
             conf = sig_score(sigs)
-            if conf < 45:
+            if conf < 45 and not relax:
                 continue
 
             target  = round(price * (1 + atp / 100 * 2), 2)
@@ -2603,17 +3052,17 @@ def s6_sector_rotation(data_map, info_map, pop_scores):
 #  STRATEGY 7: OPENING RANGE BREAKOUT (ORB)
 # ──────────────────────────────────────────────
 
-def s7_orb(data_map, info_map, pop_scores, bench_c=None):
+def s7_orb(data_map, info_map, pop_scores, bench_c=None, relax=False):
     results = []
     for ticker, df in data_map.items():
         try:
-            if _is_blocked(ticker, info_map, 7):
+            if _is_blocked(ticker, info_map, 7) and not relax:
                 continue
             if len(df) < 21:
                 continue
             c, v, h, l, o = df["Close"], df["Volume"], df["High"], df["Low"], df["Open"]
             price   = float(c.iloc[-1])
-            if price < 1:
+            if price < 1 and not relax:
                 continue
 
             today_o = float(o.iloc[-1])
@@ -2659,7 +3108,7 @@ def s7_orb(data_map, info_map, pop_scores, bench_c=None):
             }
 
             conf = sig_score(sigs)
-            if conf < 45:
+            if conf < 45 and not relax:
                 continue
 
             pop = pop_scores.get(ticker, 0)
@@ -2710,10 +3159,15 @@ def display(title, subtitle, rows, color):
         "PopScore": 9, "Target": 14, "Stop": 10, "RR": 7,
         "Confidence": 11, "vsEMA20": 9, "vsEMA50": 9, "Mom1M": 8,
         "Mom3M": 8, "UpDnVol": 9, "HH_HL": 7, "Timeframe": 10,
-        "Gap": 7, "FlatBase": 9, "H52Break": 10,
+        "Gap": 7, "PM_Gap": 8, "FlatBase": 9, "H52Break": 10,
         "Phase": 13, "SetupQ": 8,
         "RSImin": 8, "RevSigns": 28, "Rev": 5, "CatQ": 6,
         "Industry": 20, "Country": 12,
+        # Strategy 4 — Quality Compounder columns
+        "Sector": 15, "RevGr": 7, "EarnGr": 7, "NetMgn": 7, "ROE": 6,
+        "PEG": 6, "Rating": 14, "Upside": 8, "Analysts": 9, "Insider": 8,
+        "Inst": 7, "ShortFlt": 9, "Beta": 6, "Trend": 8, "Mom6M": 8,
+        "Pos52": 7, "QualityQ": 9, "EarnIn": 7,
     }
     t = Table(box=box.SIMPLE_HEAVY, header_style=f"bold {color}",
               show_lines=True, expand=True)
@@ -2734,7 +3188,7 @@ def timing_banner():
     hour = now.hour + now.minute / 60
     if 20 <= hour <= 24 or hour < 2:
         window = "🌙 Overnight Prep Window"
-        best   = "Strategies 4 (Earnings), 5 (Oversold), 6 (Sector Rotation)  →  --overnight"
+        best   = "Strategies 4 (Quality Compounder), 5 (Oversold), 6 (Sector Rotation)  →  --overnight"
         tip    = "Build your watchlist now. Know your setups before you sleep."
     elif 6 <= hour < 9.5:
         window = "Premarket"
@@ -2780,8 +3234,8 @@ def main():
     ap.add_argument("--morning",       action="store_true")
     ap.add_argument("--ten-am",        action="store_true")
     ap.add_argument("--sources",       nargs="+",
-                    default=["finviz", "yahoo", "reddit", "insider", "quality", "momentum", "finnhub", "movers"],
-                    choices=["finviz", "yahoo", "reddit", "nasdaq", "insider", "quality", "momentum", "finnhub", "movers"])
+                    default=["finviz", "yahoo", "reddit", "insider", "quality", "momentum", "finnhub", "movers", "robinhood"],
+                    choices=["finviz", "yahoo", "reddit", "nasdaq", "insider", "quality", "momentum", "finnhub", "movers", "webull", "robinhood"])
     ap.add_argument("--max",           type=int, default=400)
     ap.add_argument("--large_universe", action="store_true",
                     help="Fetch a wider universe by pulling deeper from the quality-filtered "
@@ -2795,6 +3249,8 @@ def main():
     max_tickers = args.max
     if args.large_universe and args.max == 400:
         max_tickers = 1000
+
+    start_time = datetime.now()
 
     console.print(Panel.fit(
         "[bold white]NASDAQ POPULARITY SCREENER  v4.0[/bold white]\n"
@@ -2825,6 +3281,18 @@ def main():
     info_map = fetch_fundamentals(list(data_map.keys()))
     enrich_short_interest(info_map)
 
+    # Premarket / live extended-hours snapshot — feeds the intraday strategies (1–3).
+    # Daily bars miss this; the snapshot carries the gap + premarket volume.
+    premarket_map = {} if args.override_polygon else fetch_polygon_premarket(list(data_map.keys()))
+
+    # Intraday 1-min bars for Strategy 1's intraday_phase model — only fetched for
+    # the S1 price band (≤$12, buffered above the $10 cap) to keep it lean.
+    intraday_map = {}
+    if 1 in run and not args.override_polygon:
+        s1_candidates = [t for t, df in data_map.items()
+                         if len(df) and float(df["Close"].iloc[-1]) <= 12.0]
+        intraday_map = fetch_polygon_intraday(s1_candidates)
+
     # SPY benchmark for relative-strength scoring
     bench_c = None
     try:
@@ -2840,32 +3308,33 @@ def main():
     exports = {}
 
     if 1 in run:
-        r1 = s1_catalyst(data_map, info_map, pop_scores, bench_c=bench_c)
+        r1 = s1_catalyst(data_map, info_map, pop_scores, bench_c=bench_c,
+                         premarket=premarket_map, intraday=intraday_map)
         display("STRATEGY 1 — CATALYST / HIGH RVOL",
-                "Price <$10 | RVOL >2x | Explosive intraday | SetupQ blends RVOL50/OBV/CMF/RS/Stage/Phase",
+                "Price <$10 | RVOL >2x | Intraday phase (VWAP/Gap&Go) | PM gap+vol | SetupQ blends RVOL50/OBV/CMF/RS/Stage/Phase",
                 r1, "red")
         exports["s1_catalyst"] = r1
 
     if 2 in run:
-        r2 = s2_swing(data_map, info_map, pop_scores, bench_c=bench_c)
+        r2 = s2_swing(data_map, info_map, pop_scores, bench_c=bench_c, premarket=premarket_map)
         display("STRATEGY 2 — MOMENTUM SWING",
                 "EMA stacked | RSI 50–68 | HH+HL | SetupQ favors Stage2 + RS leaders + accumulation",
                 r2, "green")
         exports["s2_swing"] = r2
 
     if 3 in run:
-        r3 = s3_breakout(data_map, info_map, pop_scores, bench_c=bench_c)
+        r3 = s3_breakout(data_map, info_map, pop_scores, bench_c=bench_c, premarket=premarket_map)
         display("STRATEGY 3 — GAP & BREAKOUT",
-                "Gap up | Flat base break | Volume confirm | Phase tag flags Base/Breakout/Continuation/Extended",
+                "PM gap + daily gap | Flat base break | Volume confirm | Phase tag flags Base/Breakout/Continuation/Extended",
                 r3, "yellow")
         exports["s3_breakout"] = r3
 
     if 4 in run:
-        r4 = s4_earnings_setup(data_map, info_map, pop_scores)
-        display("STRATEGY 4 — EARNINGS VOLATILITY SETUP",
-                "Earnings in 1–3 days | IV setup | Momentum into catalyst | Run: Night before",
+        r4 = s4_quality_compounder(data_map, info_map, pop_scores, bench_c=bench_c)
+        display("STRATEGY 4 — QUALITY GROWTH (4–6 MONTH HOLD)",
+                "Stage-2 uptrend + real momentum | strong growth (decent—not strict—fundamentals) | analyst + insider/inst backing | tradeable volatility welcome",
                 r4, "magenta")
-        exports["s4_earnings"] = r4
+        exports["s4_quality"] = r4
 
     if 5 in run:
         r5 = s5_oversold_reversal(data_map, info_map, pop_scores)
@@ -2905,7 +3374,7 @@ def main():
     console.print(Panel(
         "[bold]WHEN TO RUN WHAT[/bold]\n\n"
         "[cyan]8 PM – Midnight (night before)[/cyan]\n"
-        "  --overnight  →  Strategies 4 (Earnings), 5 (Oversold), 6 (Sector Rotation)\n\n"
+        "  --overnight  →  Strategies 4 (Quality Compounder), 5 (Oversold), 6 (Sector Rotation)\n\n"
         "[green]6:00 – 9:30 AM  (premarket)[/green]\n"
         "  --morning    →  Strategies 1 (Catalyst/RVOL), 2 (Swing), 3 (Gap/Breakout)\n\n"
         "[yellow]10:00 – 10:30 AM  (after open dust settles)[/yellow]\n"
@@ -2919,8 +3388,11 @@ def main():
         "[dim]Educational use only. Not financial advice. Trade at your own risk.[/dim]",
         border_style="yellow"))
 
-    end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    console.print(f"\n[dim]Completed: {end_time}[/dim]")
+    end_time = datetime.now()
+    end_time_str = end_time.strftime("%Y-%m-%d %H:%M:%S")
+    elapsed = end_time - start_time
+    minutes, seconds = divmod(int(elapsed.total_seconds()), 60)
+    console.print(f"\n[dim]Completed: {end_time_str}  |  Time taken: {minutes}m {seconds}s[/dim]")
 
 
 if __name__ == "__main__":
