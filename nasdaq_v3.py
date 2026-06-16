@@ -1313,7 +1313,7 @@ def fetch_finviz_momentum(top_n: int = 200, max_pages: int = 5) -> dict:
 # ──────────────────────────────────────────────
 
 def build_universe(sources: list, max_tickers: int = 500, show: bool = False,
-                   large: bool = False) -> tuple:
+                   large: bool = False, sleeper_quota: int = 150) -> tuple:
     console.print(Panel.fit("[bold]🌐 BUILDING POPULARITY UNIVERSE[/bold]", border_style="blue"))
     combined = defaultdict(float)
     finviz_hit = False
@@ -1425,8 +1425,34 @@ def build_universe(sources: list, max_tickers: int = 500, show: bool = False,
     # Re-rank after Finnhub enrichment
     combined_final = sorted(combined.items(), key=lambda x: x[1], reverse=True)
     top = combined_final[:max_tickers]
+    top_set = {t for t, _ in top}
 
-    console.print(f"\n[bold green]Final Universe: {len(top):,} tickers (ranked by popularity + fundamentals)[/bold green]\n")
+    # ── SLEEPER PICKS ──────────────────────────────────────────────────────
+    # The top-N-by-popularity cut systematically drops quietly-strong names that
+    # aren't trending. So we reserve a quota for tickers that scored well on the
+    # *quality* sources (insider cluster buys, Finviz quality + momentum screens)
+    # but didn't make the popularity cut. This widens small/mid-cap variety and
+    # surfaces sleepers — concretely and reproducibly, not by luck.
+    QUALITY_TASKS = ("insider", "quality", "momentum")
+    quality_pool  = defaultdict(float)
+    for qname in QUALITY_TASKS:
+        for t, s in raw_results.get(qname, {}).items():
+            if 1 <= len(t) <= 5 and t.isalpha() and t not in TICKER_BLACKLIST:
+                quality_pool[t] += s
+
+    sleepers = []
+    if sleeper_quota > 0 and quality_pool:
+        sleepers = sorted(((t, sc) for t, sc in quality_pool.items() if t not in top_set),
+                          key=lambda x: x[1], reverse=True)[:sleeper_quota]
+        for t, sc in sleepers:
+            combined[t] = combined.get(t, 0.0) + sc   # give sleepers a real pop score too
+        top = top + [(t, combined[t]) for t, _ in sleepers]
+        console.print(f"[bold green]💤 + {len(sleepers)} quality sleeper picks "
+                      f"(strong on quality signals, below the popularity cut)[/bold green]")
+
+    console.print(f"\n[bold green]Final Universe: {len(top):,} tickers "
+                  f"({len(top)-len(sleepers)} popular + {len(sleepers)} sleepers, "
+                  f"ranked by popularity + fundamentals)[/bold green]\n")
 
     if show:
         console.print("[bold]Top 50 Most Popular Tickers:[/bold]")
@@ -1436,7 +1462,8 @@ def build_universe(sources: list, max_tickers: int = 500, show: bool = False,
             console.print(f"  {i:3}. [cyan]{ticker:6}[/cyan] {bar} {score:.0f}")
         console.print()
 
-    return [t for t, _ in top], dict(top)
+    final_tickers = [t for t, _ in top]
+    return final_tickers, {t: combined.get(t, 0.0) for t in final_tickers}
 
 
 # ──────────────────────────────────────────────
@@ -2285,11 +2312,279 @@ def _is_blocked(ticker: str, info_map: dict, strategy: int) -> bool:
 
 
 # ──────────────────────────────────────────────
+#  POPULARITY NORMALISATION + INTRADAY CONVICTION
+#  (helpers for Strategy 1's reworked PopScore / Confidence)
+# ──────────────────────────────────────────────
+
+def _pop_percentile_map(pop_scores: dict) -> dict:
+    """Turn raw popularity scores (arbitrary magnitude) into an interpretable
+    0–100 percentile rank within the universe. PopScore 95 ⇒ more popular than
+    95% of the universe — far more meaningful than the raw weighted count."""
+    if not pop_scores:
+        return {}
+    arr = np.array(list(pop_scores.values()), dtype=float)
+    n   = len(arr)
+    return {t: round(float((arr <= s).sum()) / n * 100) for t, s in pop_scores.items()}
+
+
+def intraday_continuation(df_min):
+    """Strategy 1's core read: 'will this keep climbing *today*?' conviction,
+    from 1-minute bars + session VWAP.
+
+    Scores how cleanly price is trending up through the session with room left
+    to run (not parabolic). Higher = more reliable continuation. Returns
+    (score 0-100 | None, phase_label, meta). None ⇒ no intraday data available.
+    """
+    if df_min is None or len(df_min) < 15:
+        return None, "No-Intraday", {}
+    try:
+        o, h, l = df_min["Open"], df_min["High"], df_min["Low"]
+        c, v    = df_min["Close"], df_min["Volume"]
+        price   = float(c.iloc[-1])
+        if price <= 0:
+            return None, "No-Intraday", {}
+
+        tp   = (h + l + c) / 3.0
+        cumv = v.cumsum()
+        vwap = (tp * v).cumsum() / cumv.replace(0, np.nan)
+        vw   = float(vwap.iloc[-1])
+        if not np.isfinite(vw) or vw <= 0:
+            return None, "No-Intraday", {}
+
+        dist       = (price - vw) / vw * 100
+        sess_h     = float(h.max()); sess_l = float(l.min())
+        rng        = sess_h - sess_l
+        pos        = (price - sess_l) / rng if rng > 0 else 0.5
+        above_frac = float((c > vwap).mean())
+
+        seg       = c.iloc[-15:].values.astype(float)
+        slope     = float(np.polyfit(np.arange(len(seg)), seg, 1)[0]) if len(seg) >= 5 else 0.0
+        slope_pct = slope / price * 100 if price > 0 else 0.0
+
+        # Volume momentum — are buyers still showing up late in the session?
+        third     = max(len(v) // 3, 1)
+        vol_early = float(v.iloc[:third].mean())
+        vol_late  = float(v.iloc[-third:].mean())
+        vol_mom   = vol_late / vol_early if vol_early > 0 else 1.0
+
+        # Intraday higher-lows: recent third's low above the middle third's low.
+        nbar     = len(l)
+        lo_mid   = float(l.iloc[nbar//3:2*nbar//3].min()) if nbar >= 6 else sess_l
+        lo_late  = float(l.iloc[-(nbar//3):].min())       if nbar >= 6 else sess_l
+        higher_lows = lo_late > lo_mid
+
+        tail_above = float((c.iloc[-3:] > vwap.iloc[-3:]).mean())
+        parabolic  = dist >= 8 and pos > 0.9
+        pulling_back = dist > 0 and pos < 0.6 and higher_lows and slope_pct <= 0.02
+
+        sigs = {
+            "above_vwap":    1.0 if dist > 0 else (0.3 if dist > -0.5 else 0.0),
+            "holds_vwap":    1.0 if above_frac >= 0.7 else (0.6 if above_frac >= 0.5 else 0.0),
+            "rising":        1.0 if slope_pct > 0.03 else (0.5 if slope_pct >= 0 else 0.0),
+            "range_pos":     1.0 if 0.60 <= pos <= 0.92 else (0.6 if pos > 0.92 else (0.4 if pos >= 0.45 else 0.0)),
+            "vol_sustain":   1.0 if vol_mom >= 1.1 else (0.6 if vol_mom >= 0.8 else 0.2),
+            "higher_lows":   1.0 if higher_lows else 0.0,
+            "tail_strength": 1.0 if tail_above >= 0.66 else (0.5 if tail_above >= 0.33 else 0.0),
+            "not_parabolic": 0.0 if parabolic else 1.0,
+        }
+        score = sig_score(sigs)
+
+        if parabolic:
+            phase = "Parabolic ⚠"
+            score = min(score, 45)                      # cap conviction — exhaustion risk
+        elif dist < -0.3 and slope_pct < 0:
+            phase = "Fade ↓"
+        elif dist <= 0 and slope_pct >= 0:
+            phase = "Reclaim ↑"
+        elif pulling_back:
+            phase = "Pullback→VWAP"
+        elif dist > 0 and pos >= 0.60 and above_frac >= 0.55 and slope_pct >= 0:
+            phase = "Gap&Go ↑" if above_frac >= 0.80 else "Trend ↑"
+        else:
+            phase = "Range"
+
+        meta = {"dist_vwap": round(dist, 2), "pos": round(pos, 2),
+                "above_frac": round(above_frac, 2), "vol_mom": round(vol_mom, 2)}
+        return score, phase, meta
+    except Exception:
+        return None, "No-Intraday", {}
+
+
+def daily_continuation(df):
+    """Fallback for when no intraday bars exist (overnight / pre-open): a daily-bar
+    proxy for 'is this positioned to keep pushing up?'. Returns (score, phase)."""
+    if df is None or len(df) < 20:
+        return 0, "—"
+    try:
+        c, v, h, l, o = df["Close"], df["Volume"], df["High"], df["Low"], df["Open"]
+        price = float(c.iloc[-1])
+        e9s   = ema(c, 9);  e9 = float(e9s.iloc[-1]); e9_prev = float(e9s.iloc[-3])
+        e20   = float(ema(c, 20).iloc[-1])
+        rising9    = e9 > e9_prev
+        upper_half = closes_upper_half(h, l, c, days=2)
+        upvol      = up_vol_expansion(c, v, 10)
+        day_chg    = (price - float(c.iloc[-2])) / float(c.iloc[-2]) * 100
+        mom3       = (price - float(c.iloc[-4])) / float(c.iloc[-4]) * 100 if len(c) >= 4 else 0
+        r          = rsi(c)
+        near_brk   = price >= float(h.iloc[-21:-1].max()) * 0.98
+
+        sigs = {
+            "above_e9":       1.0 if price > e9 else 0.0,
+            "above_e20":      1.0 if price > e20 else 0.0,
+            "rising_e9":      1.0 if rising9 else 0.0,
+            "closed_strong":  1.0 if upper_half else 0.0,
+            "up_vol_expand":  1.0 if upvol else 0.0,
+            "positive_day":   1.0 if day_chg > 0 else 0.0,
+            "mom3_positive":  1.0 if mom3 > 0 else 0.0,
+            "not_overbought": 1.0 if r < 78 else 0.0,
+            "near_breakout":  1.0 if near_brk else 0.0,
+        }
+        score = sig_score(sigs)
+        if price > e9 and rising9 and upper_half:
+            phase = "Continuation ↑"
+        elif price < e9 and price > e20:
+            phase = "Pullback"
+        elif price < e20:
+            phase = "Weak"
+        else:
+            phase = "Base"
+        return score, phase
+    except Exception:
+        return 0, "—"
+
+
+# ──────────────────────────────────────────────
+#  STRATEGY 1 — "HOP IN NOW" 1–10 SCORE + MOVE-TYPE CLASSIFIER
+#  Distills the whole catalyst read into ONE number you can act on, plus a tag
+#  for what kind of move it is (multi-day / all-day / premarket / postmarket / mix).
+# ──────────────────────────────────────────────
+
+def _et_hour(now_et=None):
+    """Current US/Eastern time as a float hour (e.g. 9.5 = 9:30 AM)."""
+    et  = pytz.timezone("America/New_York")
+    now = now_et or datetime.now(et)
+    return now.hour + now.minute / 60
+
+
+def classify_move(hour, phase, imeta, pm, pm_relvol, near_brk, day_chg, mom3, rs, rvol_val):
+    """Label the *character* of the move so you know what you're hopping into:
+    a Multi-day runner (carries past today), an All-day trend (ride the session),
+    a Premarket pop, a Postmarket (after-hours) pop, or a Mix. Reads the live ET
+    session window together with the daily structure, the intraday VWAP read, and
+    the premarket snapshot. Returns a short label string."""
+    pm_gap     = float(pm["pm_gap"]) if pm else 0.0
+    above_frac = imeta.get("above_frac", 0.0)
+    vol_mom    = imeta.get("vol_mom", 1.0)
+    pos        = imeta.get("pos", 0.5)
+    has_intra  = bool(imeta)
+
+    premarket_window  = 4.0 <= hour < 9.5
+    afterhours_window = 16.0 <= hour < 20.0
+
+    arche = {}
+
+    # Multi-day runner — daily breakout + momentum + relative strength, still
+    # holding (not exhausted): the kind of move that tends to carry into tomorrow.
+    md = 0.0
+    if near_brk:        md += 0.35
+    if mom3 >= 5:       md += 0.25
+    elif mom3 >= 2:     md += 0.12
+    if (rs or 0) > 2:   md += 0.20
+    elif (rs or 0) > 0: md += 0.10
+    if rvol_val >= 2:   md += 0.10
+    if has_intra and above_frac >= 0.6 and "Parabolic" not in phase:
+        md += 0.10
+    if "Parabolic" in phase or "Fade" in phase:
+        md *= 0.5
+    arche["Multi-day"] = min(md, 1.0)
+
+    # All-day trend — intraday holds above VWAP across the session with buyers
+    # still showing up late: rides the whole regular session.
+    ad = 0.0
+    if has_intra:
+        if above_frac >= 0.70:   ad += 0.40
+        elif above_frac >= 0.55: ad += 0.25
+        if "Gap&Go" in phase or "Trend" in phase: ad += 0.25
+        if vol_mom >= 1.0:       ad += 0.15
+        if 0.50 <= pos <= 0.95:  ad += 0.10
+        if "Fade" in phase:      ad *= 0.40
+    arche["All-day"] = min(ad, 1.0)
+
+    # Premarket pop — gap + premarket volume, weighted up while still pre-open.
+    pmkt = 0.0
+    if pm_gap >= 4:         pmkt += 0.40
+    elif pm_gap >= 1.5:     pmkt += 0.20
+    if pm_relvol >= 0.30:   pmkt += 0.30
+    elif pm_relvol >= 0.10: pmkt += 0.15
+    if premarket_window:    pmkt += 0.30
+    arche["Premarket"] = min(pmkt, 1.0)
+
+    # Postmarket pop — a fresh move during the after-hours window (earnings/news).
+    ah = 0.0
+    if afterhours_window:
+        ah += 0.40
+        if abs(pm_gap) >= 4:     ah += 0.35
+        elif abs(pm_gap) >= 1.5: ah += 0.20
+        if pm_relvol >= 0.10:    ah += 0.15
+    arche["Postmarket"] = min(ah, 1.0)
+
+    ranked = sorted(arche.items(), key=lambda kv: kv[1], reverse=True)
+    (top, topv), (second, secv) = ranked[0], ranked[1]
+    if topv < 0.25:
+        return "Unclear"
+    if secv >= 0.45 and secv >= topv - 0.15:
+        return f"Mix:{top}+{second}"
+    return top
+
+
+def hop_in_scores(conf, base_conf, setupq, catq, phase):
+    """Return (entry_score, strength_score), both on a 1–10 scale.
+
+    entry_score    — 'should I hop in *right now*?'  Driven by continuation
+                     conviction + setup/catalyst quality, then reality-checked on
+                     entry TIMING: chasing a parabolic top or catching a fade is
+                     capped LOW even when the move is huge. 10 = clean, reliable
+                     entry you can lean on.
+    strength_score — raw horsepower of the move, ignoring entry timing. A vertical
+                     monster reads high here even while entry_score says don't
+                     chase. The gap between them is the signal: high Strength +
+                     low Score = 'great mover, wait for a pullback'.
+    """
+    composite = conf * 0.55 + setupq * 0.20 + catq * 0.25
+    entry = composite / 10.0
+    if "Parabolic" in phase:
+        entry = min(entry, 4.0)        # chasing a vertical move — bad 'right now' entry
+    elif "Fade" in phase:
+        entry = min(entry, 3.0)        # rolling over, wrong direction
+    elif phase == "Range":
+        entry = min(entry, 6.0)        # no edge this second
+    entry = int(max(1, min(10, round(entry))))
+
+    strength = (base_conf * 0.50 + catq * 0.30 + setupq * 0.20) / 10.0
+    if "Parabolic" in phase:
+        strength = max(strength, 8.0)  # parabolic = maximum raw momentum
+    strength = int(max(1, min(10, round(strength))))
+    return entry, strength
+
+
+def hop_verdict(score, phase):
+    """One-glance call derived from the entry score + live phase."""
+    if "Parabolic" in phase: return "⚠ Extended—don't chase"
+    if "Fade" in phase:      return "⛔ Fading—avoid"
+    if score >= 8:           return "🔥 Strong—hop in"
+    if score >= 6:           return "✅ Decent—size in"
+    if score >= 4:           return "⚠ Wait for confirm"
+    return "⛔ Skip"
+
+
+# ──────────────────────────────────────────────
 #  STRATEGY 1: HIGH RVOL / CATALYST
 # ──────────────────────────────────────────────
 
 def s1_catalyst(data_map, info_map, pop_scores, bench_c=None, premarket=None, intraday=None, relax=False):
     results = []
+    pop_pct = _pop_percentile_map(pop_scores)   # 0–100 percentile, computed once
+    hour    = _et_hour()                         # live ET session window for move typing
     for ticker, df in data_map.items():
         try:
             if _is_blocked(ticker, info_map, 1) and not relax:
@@ -2314,79 +2609,90 @@ def s1_catalyst(data_map, info_map, pop_scores, bench_c=None, premarket=None, in
             body    = abs(float(c.iloc[-1]) - float(o.iloc[-1]))
             rng     = float(h.iloc[-1]) - float(l.iloc[-1])
             body_r  = body / rng if rng > 0 else 0
-            pop     = pop_scores.get(ticker, 0)
+            popp    = pop_pct.get(ticker, 0)            # popularity percentile (0-100)
             pm      = (premarket or {}).get(ticker)
-            iphase  = intraday_phase((intraday or {}).get(ticker))
 
-            sigs = {
+            # ── Catalyst BASE: is there a real, liquid move here at all? ──
+            base_sigs = {
                 "rvol":        1.0 if rv >= 2.5 else (0.5 if rv >= 1.5 else 0.0),
-                "price_range": 1.0,
-                "rsi_zone":    1.0 if 42 <= r <= 72 else 0.0,
+                "rsi_zone":    1.0 if 42 <= r <= 74 else 0.0,
                 "big_move":    1.0 if abs(day_chg) >= 5 else (0.5 if abs(day_chg) >= 3 else 0.0),
                 "breakout":    1.0 if near_brk else 0.0,
                 "vol_spike":   1.0 if vspike >= 3 else (0.5 if vspike >= 2 else 0.0),
                 "momentum":    1.0 if mom3 > 0 else 0.0,
-                "high_atr":    1.0 if atp >= 5 else (0.5 if atp >= 3 else 0.0),
                 "bull_candle": 1.0 if (body_r > 0.55 and c.iloc[-1] > o.iloc[-1]) else 0.0,
-                "popular":     1.0 if pop > 100 else (0.5 if pop > 20 else 0.0),
+                "popular":     1.0 if popp >= 80 else (0.5 if popp >= 50 else 0.0),
             }
-
-            # Premarket / live catalyst confirmation — only scored when a snapshot
-            # exists (markets open). Avoids penalizing runs after hours/weekends.
+            # Premarket confirmation folds into the base when a live snapshot exists.
             if pm:
-                v20pm      = float(v.iloc[-21:-1].mean())
-                pm_relvol  = pm["pm_vol"] / v20pm if v20pm > 0 else 0
-                sigs["pm_gap"]    = 1.0 if pm["pm_gap"] >= 4 else (0.5 if pm["pm_gap"] >= 1.5 else 0.0)
-                sigs["pm_volume"] = 1.0 if pm_relvol >= 0.30 else (0.5 if pm_relvol >= 0.10 else 0.0)
+                v20pm     = float(v.iloc[-21:-1].mean())
+                pm_relvol = pm["pm_vol"] / v20pm if v20pm > 0 else 0
+                base_sigs["pm_gap"]    = 1.0 if pm["pm_gap"] >= 4 else (0.5 if pm["pm_gap"] >= 1.5 else 0.0)
+                base_sigs["pm_volume"] = 1.0 if pm_relvol >= 0.30 else (0.5 if pm_relvol >= 0.10 else 0.0)
+            base_conf = sig_score(base_sigs)
 
-            # Intraday structure (only scored when 1-min bars exist): reward names
-            # holding above VWAP (Gap&Go / reclaim), penalize fades/parabolic chases.
-            if iphase != "Unknown":
-                sigs["intraday"] = {
-                    "Gap&Go":       1.0,
-                    "VWAP-Reclaim": 1.0,
-                    "Range":        0.5,
-                    "Parabolic":    0.3,
-                    "Fade":         0.0,
-                }.get(iphase, 0.0)
+            # ── CONVICTION: will it keep climbing? This now DRIVES Confidence, so the
+            #    number means "how reliable is further upside today", not just "is it
+            #    moving". Intraday 1-min read when available; daily proxy otherwise. ──
+            cont_score, iphase, imeta = intraday_continuation((intraday or {}).get(ticker))
+            if cont_score is not None:
+                conf  = round(0.65 * cont_score + 0.35 * base_conf)
+                phase = iphase                                   # live VWAP-based regime
+            else:
+                dcont, dphase = daily_continuation(df)
+                conf  = round(0.60 * dcont + 0.40 * base_conf)
+                phase = dphase                                   # daily-bar regime tag
+                imeta = {}                                       # no intraday VWAP read
 
-            conf   = sig_score(sigs)
             if conf < 40 and not relax:
                 continue
 
-            setupq, phase, _meta = setup_quality_score(df, bench_c, pop)
-            # S1 is an intraday catalyst regime — prefer the intraday phase tag
-            # over the daily-swing breakout_phase when minute bars are available.
-            if iphase != "Unknown":
-                phase = iphase
-            info   = info_map.get(ticker, {})
-            catq   = catalyst_quality_score(info, c, h, l, o, v, bench_c, rv, price)
+            setupq, _bphase, _meta = setup_quality_score(df, bench_c, popp)
+            info = info_map.get(ticker, {})
+            catq = catalyst_quality_score(info, c, h, l, o, v, bench_c, rv, price)
+            rs   = rs_vs_benchmark(c, bench_c, periods=(5, 10)) if bench_c is not None else None
 
             target = round(price * (1 + atp / 100 * 2.2), 2)
             stop   = round(price * (1 - atp / 100 * 0.9), 2)
             rr     = round((target - price) / (price - stop), 2) if price > stop else 0
 
-            cap    = info.get("marketCap", 0)
-            cap_lbl= "Micro" if cap < 300e6 else ("Small" if cap < 2e9 else "Mid")
-            industry = info.get("industry", "—")
-            country = info.get("country", "—")
+            # ── The two headline numbers ──
+            entry_score, strength_score = hop_in_scores(conf, base_conf, setupq, catq, phase)
+            verdict = hop_verdict(entry_score, phase)
+
+            # ── What KIND of move is this? ──
+            pm_relvol = 0.0
+            if pm:
+                v20pm     = float(v.iloc[-21:-1].mean())
+                pm_relvol = pm["pm_vol"] / v20pm if v20pm > 0 else 0.0
+            move_type = classify_move(hour, phase, imeta, pm, pm_relvol,
+                                      near_brk, day_chg, mom3, rs, rv)
+
+            # ── A few words on WHY (the strongest live drivers) ──
+            drivers = []
+            if near_brk:                         drivers.append("breakout")
+            if rv >= 2.5:                        drivers.append(f"{rv:.0f}xRVOL")
+            elif rv >= 1.5:                      drivers.append(f"{rv:.1f}xRVOL")
+            if pm and pm["pm_gap"] >= 1.5:       drivers.append(f"PM+{pm['pm_gap']:.0f}%")
+            if (rs or 0) > 2:                    drivers.append("RSlead")
+            if imeta.get("above_frac", 0) >= 0.7: drivers.append("holdsVWAP")
+            if "Pullback" in phase or "Reclaim" in phase: drivers.append("pullback-entry")
+            drivers_str = ", ".join(drivers[:4]) if drivers else "—"
 
             results.append(dict(
-                Ticker=ticker, Price=f"${price:.2f}", RVOL=f"{rv}x",
-                PM_Gap=f"{pm['pm_gap']:+.1f}%" if pm else "—",
-                DayChg=f"{day_chg:+.1f}%", RSI=round(r, 1),
-                ATR_pct=f"{atp:.1f}%", Cap=cap_lbl,
-                Phase=phase, SetupQ=setupq, CatQ=catq,
-                Breakout="✅" if near_brk else "—",
-                PopScore=round(pop), Target=f"${target}",
-                Stop=f"${stop}", RR=f"1:{rr}",
-                Confidence=conf, Industry=industry, Country=country,
-                _score=(conf + setupq + catq) / 3,
+                Ticker=ticker, Price=f"${price:.2f}",
+                Score=entry_score, Strength=strength_score,
+                Verdict=verdict, Type=move_type, Phase=phase,
+                RVOL=f"{rv}x", DayChg=f"{day_chg:+.1f}%",
+                Target=f"${target}", Stop=f"${stop}", RR=f"1:{rr}",
+                Drivers=drivers_str,
+                # Sort by the entry score you actually act on; composite breaks ties.
+                _score=(conf * 0.55 + setupq * 0.20 + catq * 0.25),
             ))
         except Exception:
             continue
 
-    results.sort(key=lambda x: x["_score"], reverse=True)
+    results.sort(key=lambda x: (x["Score"], x["_score"]), reverse=True)
     [r.pop("_score") for r in results]
     return results[:20]
 
@@ -3144,6 +3450,116 @@ def s7_orb(data_map, info_map, pop_scores, bench_c=None, relax=False):
 
 
 # ──────────────────────────────────────────────
+#  STRATEGY 8: POWER SWING  (1–2 week hold)
+#
+#  Fills the gap between S1 (intraday) and S2 (4–8 wks). HYBRID — fires on
+#  whichever short-term setup is present:
+#    • Pullback bounce  — uptrend dips to a rising 9/20 EMA, then turns up
+#    • Breakout follow  — tight 5–10d range breaks out on a volume surge
+#  Tight 1–2 week targets (≈5–14%), small-mid-cap friendly (price ≥ $3).
+# ──────────────────────────────────────────────
+
+def s8_power_swing(data_map, info_map, pop_scores, bench_c=None, relax=False):
+    results = []
+    pop_pct = _pop_percentile_map(pop_scores)
+    for ticker, df in data_map.items():
+        try:
+            if _is_blocked(ticker, info_map, 8) and not relax:
+                continue
+            if len(df) < 35:
+                continue
+            c, v, h, l, o = df["Close"], df["Volume"], df["High"], df["Low"], df["Open"]
+            price = float(c.iloc[-1])
+            if price < 3 and not relax:        # small-mid friendly, skips sub-$3 noise
+                continue
+
+            e9s  = ema(c, 9);  e9  = float(e9s.iloc[-1]);  e9p  = float(e9s.iloc[-3])
+            e20s = ema(c, 20); e20 = float(e20s.iloc[-1]); e20p = float(e20s.iloc[-3])
+            e50  = float(ema(c, 50).iloc[-1])
+            r    = rsi(c)
+            a    = atr(h, l, c); atp = (a / price) * 100
+            rv   = rvol(v)
+            mom5  = (price - float(c.iloc[-6]))  / float(c.iloc[-6])  * 100 if len(c) >= 6  else 0
+            mom10 = (price - float(c.iloc[-11])) / float(c.iloc[-11]) * 100 if len(c) >= 11 else 0
+
+            uptrend     = e9 > e20 and price > e50 and e20 >= e20p
+            rising_emas = e9 >= e9p and e20 >= e20p
+            day_up      = price > float(c.iloc[-2]) and price > float(o.iloc[-1])
+            upper_half  = closes_upper_half(h, l, c, days=1)
+            dist_e9     = (price - e9)  / e9  * 100
+            dist_e20    = (price - e20) / e20 * 100
+
+            # — Pullback bounce: hugging a rising 20-EMA from just below/above, turning up
+            pulled_back = -1.5 * atp <= dist_e20 <= 2.0
+            bounce      = uptrend and rising_emas and pulled_back and day_up and 40 <= r <= 62
+
+            # — Breakout follow-through: tight base breaks prior-day & 10-day high on volume
+            hi10  = float(h.iloc[-11:-1].max())
+            rng10 = (hi10 - float(l.iloc[-11:-1].min())) / price if price > 0 else 1
+            tight = rng10 < 0.14
+            breakout = price >= hi10 * 0.995 and price > float(h.iloc[-2]) and rv >= 1.3 and upper_half
+
+            if not (bounce or breakout) and not relax:
+                continue
+            setup = ("Pull+Brk" if (bounce and breakout)
+                     else "Pullback" if bounce
+                     else "Breakout" if breakout else "—")
+
+            rs  = rs_vs_benchmark(c, bench_c, periods=(10, 21))
+            pop = pop_scores.get(ticker, 0)
+
+            sigs = {
+                "uptrend":       1.0 if uptrend else 0.0,
+                "rising_emas":   1.0 if rising_emas else 0.0,
+                "above_e50":     1.0 if price > e50 else 0.0,
+                "setup_present": 1.0 if (bounce or breakout) else 0.0,
+                "bounce":        1.0 if bounce else 0.0,
+                "breakout":      1.0 if breakout else 0.0,
+                "day_strength":  1.0 if (day_up and upper_half) else (0.5 if day_up else 0.0),
+                "rsi_zone":      1.0 if 45 <= r <= 65 else (0.5 if 40 <= r <= 70 else 0.0),
+                "mom10_pos":     1.0 if mom10 > 0 else 0.0,
+                "rvol_ok":       1.0 if rv >= 1.3 else (0.5 if rv >= 1.0 else 0.0),
+                "rs_leader":     (1.0 if rs > 3 else (0.6 if rs > 0 else 0.0)) if rs is not None else 0.4,
+                "tight_or_pb":   1.0 if (tight or pulled_back) else 0.0,
+                "popular":       1.0 if pop_pct.get(ticker, 0) >= 60 else (0.5 if pop_pct.get(ticker, 0) >= 30 else 0.0),
+            }
+            conf = sig_score(sigs)
+            if conf < 48 and not relax:
+                continue
+
+            setupq, phase, _meta = setup_quality_score(df, bench_c, pop)
+
+            # Tight 1–2 week target: ~1.6× ATR move, clamped to a realistic 5–14%.
+            tgt_pct = max(5, min(14, atp * 1.6))
+            target  = round(price * (1 + tgt_pct / 100), 2)
+            stop    = round(min(e20, price * (1 - atp / 100 * 1.1)), 2)
+            rr      = round((target - price) / (price - stop), 2) if price > stop else 0
+
+            info     = info_map.get(ticker, {})
+            cap      = info.get("marketCap", 0)
+            cap_lbl  = "Micro" if cap < 300e6 else ("Small" if cap < 2e9 else ("Mid" if cap < 10e9 else "Large"))
+            industry = info.get("industry", "—")
+
+            results.append(dict(
+                Ticker=ticker, Price=f"${price:.2f}", Setup=setup,
+                RSI=round(r, 1), vsEMA9=f"{dist_e9:+.1f}%", vsEMA20=f"{dist_e20:+.1f}%",
+                Mom5=f"{mom5:+.1f}%", Mom10=f"{mom10:+.1f}%", RVOL=f"{rv}x",
+                RS=(f"{rs:+.0f}" if rs is not None else "—"), Cap=cap_lbl,
+                Phase=phase, SetupQ=setupq,
+                Target=f"${target}(+{tgt_pct:.0f}%)", Stop=f"${stop}", RR=f"1:{rr}",
+                Timeframe="1–2 wks", PopScore=pop_pct.get(ticker, 0),
+                Confidence=conf, Industry=industry,
+                _score=(conf * 0.6 + setupq * 0.4),
+            ))
+        except Exception:
+            continue
+
+    results.sort(key=lambda x: x["_score"], reverse=True)
+    [r.pop("_score") for r in results]
+    return results[:20]
+
+
+# ──────────────────────────────────────────────
 #  DISPLAY
 # ──────────────────────────────────────────────
 
@@ -3163,11 +3579,15 @@ def display(title, subtitle, rows, color):
         "Phase": 13, "SetupQ": 8,
         "RSImin": 8, "RevSigns": 28, "Rev": 5, "CatQ": 6,
         "Industry": 20, "Country": 12,
+        # Strategy 1 — "hop in now" scoring columns
+        "Score": 6, "Strength": 9, "Verdict": 22, "Type": 18, "Drivers": 32,
         # Strategy 4 — Quality Compounder columns
         "Sector": 15, "RevGr": 7, "EarnGr": 7, "NetMgn": 7, "ROE": 6,
         "PEG": 6, "Rating": 14, "Upside": 8, "Analysts": 9, "Insider": 8,
         "Inst": 7, "ShortFlt": 9, "Beta": 6, "Trend": 8, "Mom6M": 8,
         "Pos52": 7, "QualityQ": 9, "EarnIn": 7,
+        # Strategy 8 — Power Swing columns
+        "Setup": 10, "vsEMA9": 9, "Mom5": 8, "Mom10": 8, "RS": 6,
     }
     t = Table(box=box.SIMPLE_HEAVY, header_style=f"bold {color}",
               show_lines=True, expand=True)
@@ -3175,8 +3595,12 @@ def display(title, subtitle, rows, color):
         mw = col_widths.get(col, 8)
         t.add_column(col, no_wrap=True, min_width=mw)
     for row in rows:
-        conf  = row.get("Confidence", 0)
-        style = "bold green" if conf >= 75 else ("yellow" if conf >= 55 else "dim white")
+        if "Score" in row:                       # Strategy 1 — 1–10 hop-in score
+            s10   = row.get("Score", 0)
+            style = "bold green" if s10 >= 8 else ("yellow" if s10 >= 5 else "dim white")
+        else:
+            conf  = row.get("Confidence", 0)
+            style = "bold green" if conf >= 75 else ("yellow" if conf >= 55 else "dim white")
         t.add_row(*[str(v) for v in row.values()], style=style)
     console.print(t)
     console.print()
@@ -3229,17 +3653,22 @@ def timing_banner():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--strategy",      type=int, choices=[1,2,3,4,5,6,7])
+    ap.add_argument("--strategy",      type=int, choices=[1,2,3,4,5,6,7,8])
     ap.add_argument("--overnight",     action="store_true")
     ap.add_argument("--morning",       action="store_true")
     ap.add_argument("--ten-am",        action="store_true")
+    ap.add_argument("--swing",         action="store_true", help="Run the swing strategies (2, 4, 8)")
     ap.add_argument("--sources",       nargs="+",
                     default=["finviz", "yahoo", "reddit", "insider", "quality", "momentum", "finnhub", "movers", "robinhood"],
                     choices=["finviz", "yahoo", "reddit", "nasdaq", "insider", "quality", "momentum", "finnhub", "movers", "webull", "robinhood"])
-    ap.add_argument("--max",           type=int, default=400)
+    ap.add_argument("--max",           type=int, default=600,
+                    help="Popularity-ranked universe size (default 600).")
+    ap.add_argument("--sleepers",      type=int, default=150,
+                    help="Extra slots for high-quality 'sleeper' names that didn't make the "
+                         "popularity cut (default 150). Set 0 to disable. Widens small/mid-cap variety.")
     ap.add_argument("--large_universe", action="store_true",
                     help="Fetch a wider universe by pulling deeper from the quality-filtered "
-                         "Finviz screens (more pages, higher cap). Defaults the cap to 1000.")
+                         "Finviz screens (more pages, higher cap). Defaults the cap to 1200.")
     ap.add_argument("--export",        action="store_true")
     ap.add_argument("--show-universe", action="store_true")
     ap.add_argument("--override_polygon", action="store_true", help="Skip Polygon and use yfinance only for price data")
@@ -3247,15 +3676,15 @@ def main():
 
     # In large mode, raise the cap unless the user explicitly set --max
     max_tickers = args.max
-    if args.large_universe and args.max == 400:
-        max_tickers = 1000
+    if args.large_universe and args.max == 600:
+        max_tickers = 1200
 
     start_time = datetime.now()
 
     console.print(Panel.fit(
         "[bold white]NASDAQ POPULARITY SCREENER  v4.0[/bold white]\n"
-        "[dim]Finviz + Yahoo + StockTwits + Reddit + OpenInsider + Quality → ranked universe → 7 strategies[/dim]\n"
-        "[dim]Strategies 1–3: Premarket/Open  |  4–6: Overnight Prep  |  7: 10 AM ORB[/dim]",
+        "[dim]Finviz + Yahoo + StockTwits + Reddit + OpenInsider + Quality (+ sleepers) → ranked universe → 8 strategies[/dim]\n"
+        "[dim]1–3: Premarket/Open  |  4–6: Overnight Prep  |  7: 10 AM ORB  |  8: 1–2wk Power Swing[/dim]",
         border_style="bright_blue", padding=(1, 4)))
     timing_banner()
 
@@ -3267,14 +3696,17 @@ def main():
         run = {1, 2, 3}
     elif getattr(args, "ten_am", False):
         run = {7}
+    elif args.swing:
+        run = {2, 4, 8}
     else:
-        run = {1, 2, 3, 4, 5, 6, 7}
+        run = {1, 2, 3, 4, 5, 6, 7, 8}
 
     tickers, pop_scores = build_universe(
         sources=args.sources,
         max_tickers=max_tickers,
         show=args.show_universe,
         large=args.large_universe,
+        sleeper_quota=args.sleepers,
     )
 
     data_map = fetch_price_data(tickers, skip_polygon=args.override_polygon)
@@ -3311,7 +3743,9 @@ def main():
         r1 = s1_catalyst(data_map, info_map, pop_scores, bench_c=bench_c,
                          premarket=premarket_map, intraday=intraday_map)
         display("STRATEGY 1 — CATALYST / HIGH RVOL",
-                "Price <$10 | RVOL >2x | Intraday phase (VWAP/Gap&Go) | PM gap+vol | SetupQ blends RVOL50/OBV/CMF/RS/Stage/Phase",
+                "Score 1–10 = should you HOP IN RIGHT NOW (10=best; chasing parabolic/fade capped low) | "
+                "Strength 1–10 = raw move horsepower (high Strength + low Score = wait for pullback) | "
+                "Type = Multi-day / All-day / Premarket / Postmarket / Mix",
                 r1, "red")
         exports["s1_catalyst"] = r1
 
@@ -3363,6 +3797,13 @@ def main():
                 r7, "bright_cyan")
         exports["s7_orb"] = r7
 
+    if 8 in run:
+        r8 = s8_power_swing(data_map, info_map, pop_scores, bench_c=bench_c)
+        display("STRATEGY 8 — POWER SWING (1–2 WEEK HOLD)",
+                "Hybrid: pullback bounce to rising 9/20 EMA OR tight-base breakout on volume | small-mid friendly | tight 5–14% targets",
+                r8, "bright_green")
+        exports["s8_power_swing"] = r8
+
     if args.export:
         ts = datetime.now().strftime("%Y%m%d_%H%M")
         for name, data in exports.items():
@@ -3379,6 +3820,8 @@ def main():
         "  --morning    →  Strategies 1 (Catalyst/RVOL), 2 (Swing), 3 (Gap/Breakout)\n\n"
         "[yellow]10:00 – 10:30 AM  (after open dust settles)[/yellow]\n"
         "  --ten-am     →  Strategy 7 (ORB)\n\n"
+        "[bright_green]Any time — swing watchlist[/bright_green]\n"
+        "  --swing      →  Strategies 2 (4–8wk), 4 (4–6mo Quality), 8 (1–2wk Power Swing)\n\n"
         "[dim]Best days: Tue/Wed/Thu for cleanest setups. Mon for gap plays. Thu for earnings.[/dim]",
         border_style="blue", padding=(0, 2)
     ))
