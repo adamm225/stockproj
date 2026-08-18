@@ -1,0 +1,15 @@
+python-dotenv
+yfinance
+pandas
+numpy
+requests
+rich
+pytz
+beautifulsoup4
+lxml
+praw
+vaderSentiment
+streamlit
+streamlit-aggrid
+selenium
+playwright
