@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0e1117">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Screener</title>
+<link rel="manifest" href="/static/manifest.json">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📈</text></svg>">
+<link rel="stylesheet" href="/static/app.css?v={{V}}">
+</head>
+<body>
+
+<header class="hdr">
+  <div class="hdr-row">
+    <div class="hdr-title">
+      <h1>Screener</h1>
+      <span id="updated" class="updated">loading…</span>
+    </div>
+    <div class="hdr-actions">
+      <button id="btn-settings" class="icon-btn" title="Settings" aria-label="Settings">⚙</button>
+      <button id="btn-run" class="run-btn">Run now</button>
+    </div>
+  </div>
+  <nav id="tabs" class="tabs"></nav>
+  <div id="progress" class="progress hidden">
+    <div class="bar"><div id="bar-fill" class="bar-fill"></div></div>
+    <div id="prog-detail" class="prog-detail"></div>
+  </div>
+</header>
+
+<main id="main">
+  <div class="empty">Loading…</div>
+</main>
+
+<!-- Settings drawer -->
+<div id="drawer-scrim" class="scrim hidden"></div>
+<aside id="drawer" class="drawer hidden">
+  <div class="drawer-hd">
+    <h2>Scan settings</h2>
+    <button id="btn-close-settings" class="icon-btn" aria-label="Close">✕</button>
+  </div>
+  <label class="field">
+    <span>Max tickers <b id="max-val">600</b></span>
+    <input id="in-max" type="range" min="50" max="1200" step="50" value="600">
+  </label>
+  <label class="check">
+    <input id="in-skip-polygon" type="checkbox">
+    <span>Skip Polygon (yfinance only)</span>
+  </label>
+  <label class="check">
+    <input id="in-large" type="checkbox">
+    <span>Large universe (deeper quality screens)</span>
+  </label>
+  <!-- Price bands. Two of them: Strategy 1 (the sub-$10 catalyst screen) has
+       its own, since a "sub $20" run there means something different than it
+       does for the swing/quality screens in 2-8. Leaving a block on Default
+       keeps each strategy's built-in gate — S1 stays sub-$10. -->
+  <fieldset class="field band">
+    <legend>Price range — Strategy 1 (Catalyst)</legend>
+    <div id="s1-presets" class="chips"></div>
+    <div id="s1-custom" class="range-row hidden">
+      <input id="in-s1-min" type="number" min="0" step="0.25" inputmode="decimal" placeholder="min">
+      <span class="range-dash">–</span>
+      <input id="in-s1-max" type="number" min="0" step="0.25" inputmode="decimal" placeholder="max">
+    </div>
+    <p id="s1-band-note" class="band-note"></p>
+  </fieldset>
+  <fieldset class="field band">
+    <legend>Price range — Strategies 2–8</legend>
+    <div id="other-presets" class="chips"></div>
+    <div id="other-custom" class="range-row hidden">
+      <input id="in-other-min" type="number" min="0" step="0.25" inputmode="decimal" placeholder="min">
+      <span class="range-dash">–</span>
+      <input id="in-other-max" type="number" min="0" step="0.25" inputmode="decimal" placeholder="max">
+    </div>
+    <p id="other-band-note" class="band-note"></p>
+  </fieldset>
+  <fieldset class="field">
+    <legend>Universe sources</legend>
+    <div id="src-list" class="chips"></div>
+  </fieldset>
+  <fieldset class="field">
+    <legend>Strategies to run</legend>
+    <div id="strat-list" class="chips"></div>
+  </fieldset>
+  <div class="drawer-ft">
+    <button id="btn-reset" class="ghost-btn">Reset to defaults</button>
+  </div>
+</aside>
+
+<script src="/static/app.js?v={{V}}"></script>
+</body>
+</html>

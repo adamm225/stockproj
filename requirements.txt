@@ -1,0 +1,22 @@
+# Core screener
+python-dotenv
+yfinance
+pandas
+numpy
+requests
+rich
+pytz
+beautifulsoup4
+lxml
+praw
+vaderSentiment
+alpaca-py
+
+# Web UI (webapp/). Starlette is FastAPI's foundation; the API is small enough
+# that pydantic would be dead weight on a Pi. sqlite3 is stdlib.
+starlette
+uvicorn
+
+# Scraping (extract_tickers.py)
+selenium
+playwright
