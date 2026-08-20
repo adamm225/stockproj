@@ -1,20 +1,20 @@
-"""The run sequence, top to bottom: parse args -> build universe -> fetch price/
-fundamental/premarket/intraday/news data -> load SPY benchmark -> run the
-selected strategies -> display -> optional CSV export."""
+"""The CLI front-end: parse args -> engine.run_scan() -> rich tables -> optional
+CSV export.
+
+The actual run sequence (universe -> price/fundamental/premarket/intraday/news
+data -> benchmark -> strategies) lives in screener/engine.py, which the web UI
+in webapp/ calls too. Keeping it there means the CLI and the dashboard can never
+drift apart.
+"""
 
 import argparse
 from datetime import datetime
 
 import pandas as pd
-import yfinance as yf
 from rich.panel import Panel
 
 from .config import console
-from .sources import build_universe
-from .marketdata import (fetch_price_data, fetch_fundamentals, enrich_short_interest,
-                         fetch_polygon_premarket, fetch_polygon_intraday, fetch_polygon_news)
-from .strategies import (industry_heat, s1_catalyst, s2_swing, s3_breakout, s4_quality_compounder,
-                         s5_oversold_reversal, s6_sector_rotation, s7_orb, s8_power_swing)
+from .engine import ALL_STRATEGIES, DEFAULT_SOURCES, STRATEGIES, run_scan
 from .display import display, display_industry_heat, timing_banner
 
 
@@ -30,7 +30,7 @@ def main():
     ap.add_argument("--ten-am",        action="store_true")
     ap.add_argument("--swing",         action="store_true", help="Run the swing strategies (2, 4, 8)")
     ap.add_argument("--sources",       nargs="+",
-                    default=["finviz", "yahoo", "reddit", "insider", "quality", "momentum", "finnhub", "movers", "robinhood"],
+                    default=DEFAULT_SOURCES,
                     choices=["finviz", "yahoo", "reddit", "nasdaq", "insider", "quality", "momentum", "finnhub", "movers", "webull", "robinhood"])
     ap.add_argument("--max",           type=int, default=600,
                     help="Popularity-ranked universe size (default 600).")
@@ -70,131 +70,51 @@ def main():
     elif args.swing:
         run = {2, 4, 8}
     else:
-        run = {1, 2, 3, 4, 5, 6, 7, 8}
+        run = set(ALL_STRATEGIES)
 
-    tickers, pop_scores = build_universe(
+    def report(phase, pct, detail=""):
+        if detail:
+            console.print(f"[dim]· {detail}[/dim]")
+
+    exports = run_scan(
         sources=args.sources,
         max_tickers=max_tickers,
-        show=args.show_universe,
+        strategies=sorted(run),
+        skip_polygon=args.override_polygon,
+        sleepers=args.sleepers,
         large=args.large_universe,
-        sleeper_quota=args.sleepers,
+        show_universe=args.show_universe,
+        progress=report,
     )
-
-    data_map = fetch_price_data(tickers, skip_polygon=args.override_polygon)
-    info_map = fetch_fundamentals(list(data_map.keys()))
-    enrich_short_interest(info_map)
-
-    # Premarket / live extended-hours snapshot — feeds the intraday strategies (1–3).
-    # Daily bars miss this; the snapshot carries the gap + premarket volume.
-    premarket_map = {} if args.override_polygon else fetch_polygon_premarket(list(data_map.keys()))
-
-    # Intraday 1-min bars for Strategy 1's intraday_phase model — only fetched for
-    # the S1 price band (≤$12, buffered above the $10 cap) to keep it lean.
-    intraday_map = {}
-    news_map     = None
-    if 1 in run and not args.override_polygon:
-        s1_candidates = [t for t, df in data_map.items()
-                         if len(df) and float(df["Close"].iloc[-1]) <= 12.0]
-        intraday_map = fetch_polygon_intraday(s1_candidates)
-        # Fresh-catalyst check for the same S1 candidate set — confirms a real news
-        # driver behind each move so the score is trustworthy, not just volume.
-        news_map = fetch_polygon_news(s1_candidates)
-
-    # SPY benchmark for relative-strength scoring
-    bench_c = None
-    try:
-        bench_df = yf.download("SPY", period="1y", interval="1d",
-                               auto_adjust=True, progress=False)
-        if bench_df is not None and len(bench_df) > 60:
-            bench_c = bench_df["Close"]
-            console.print(f"[green]✔ Benchmark: SPY ({len(bench_c)} bars) loaded for RS scoring[/green]")
-    except Exception as e:
-        console.print(f"[yellow]⚠ SPY benchmark failed: {e} — RS score will be neutral[/yellow]")
     console.print()
 
-    exports = {}
+    # Industry heat is market context for the Strategy 1 picks — print it first.
+    heat = exports.get("heat")
+    if heat:
+        display_industry_heat(heat["gainers"], heat["losers"])
 
-    if 1 in run:
-        # Market context first: which industries are leading/lagging today, so the
-        # catalyst picks below can be read against the rotation backdrop.
-        heat_gainers, heat_losers = industry_heat(data_map, info_map, premarket=premarket_map)
-        display_industry_heat(heat_gainers, heat_losers)
-
-        r1 = s1_catalyst(data_map, info_map, pop_scores, bench_c=bench_c,
-                         premarket=premarket_map, intraday=intraday_map, news=news_map)
-        display("STRATEGY 1 — CATALYST / HIGH RVOL",
-                "Price = prior close (setup anchor) | LivePrice = EXACT live pre/post quote, session-stamped (PRE/LIVE/AH) with today's % | "
-                "LiveVol = shares traded so far this session + % of a normal full day | DayChg = today's change so far | "
-                "Score 1–10 = should you HOP IN RIGHT NOW (10=best; chasing parabolic/fade capped low) | "
-                "Strength 1–10 = raw move horsepower (high Strength + low Score = wait for pullback) | "
-                "Type = Multi-day / All-day / Premarket / Postmarket / Mix | "
-                "News = fresh catalyst (count·age); 'none ⚠' = unexplained spike",
-                r1, "red")
-        exports["s1_catalyst"] = r1
-
-    if 2 in run:
-        r2 = s2_swing(data_map, info_map, pop_scores, bench_c=bench_c, premarket=premarket_map)
-        display("STRATEGY 2 — MOMENTUM SWING",
-                "EMA stacked | RSI 50–68 | HH+HL | SetupQ favors Stage2 + RS leaders + accumulation",
-                r2, "green")
-        exports["s2_swing"] = r2
-
-    if 3 in run:
-        r3 = s3_breakout(data_map, info_map, pop_scores, bench_c=bench_c, premarket=premarket_map)
-        display("STRATEGY 3 — GAP & BREAKOUT",
-                "PM gap + daily gap | Flat base break | Volume confirm | Phase tag flags Base/Breakout/Continuation/Extended",
-                r3, "yellow")
-        exports["s3_breakout"] = r3
-
-    if 4 in run:
-        r4 = s4_quality_compounder(data_map, info_map, pop_scores, bench_c=bench_c)
-        display("STRATEGY 4 — QUALITY GROWTH (4–6 MONTH HOLD)",
-                "Stage-2 uptrend + real momentum | strong growth (decent—not strict—fundamentals) | analyst + insider/inst backing | "
-                "Entry = 🟢 good / ⚪ fair / 🟡 extended / 🔴 peak-risk (vsE50 = % above 50-day; extended names are down-ranked so you're not buying the top)",
-                r4, "magenta")
-        exports["s4_quality"] = r4
-
-    if 5 in run:
-        r5 = s5_oversold_reversal(data_map, info_map, pop_scores)
-        display("STRATEGY 5 — OVERSOLD REVERSAL HUNTER",
-                "Was oversold + ≥2 reversal signs (RSI↑/Div/MACD↑/EMA reclaim/HL/UpV/UpHalf) | Run: Night before",
-                r5, "cyan")
-        exports["s5_oversold"] = r5
-
-    if 6 in run:
-        result6 = s6_sector_rotation(data_map, info_map, pop_scores)
-        if result6 and len(result6) == 2:
-            sector_lb, r6 = result6
-            display("SECTOR HEAT MAP — Which sectors have money flowing in",
-                    "Sorted by momentum score — top 4 sectors feed stock picks below",
-                    sector_lb, "bright_magenta")
-            display("STRATEGY 6 — TOP STOCKS IN HOT SECTORS",
-                    "Stocks inside the strongest rotating sectors | EMA aligned | Run: Night before",
-                    r6, "bright_magenta")
-            exports["s6_sectors"]       = sector_lb
-            exports["s6_sector_stocks"] = r6
-
-    if 7 in run:
-        r7 = s7_orb(data_map, info_map, pop_scores, bench_c=bench_c)
-        display("STRATEGY 7 — OPENING RANGE BREAKOUT (10 AM)",
-                "Gap held | Above open | Volume surging | First 30-min high broken | Run: 10 AM",
-                r7, "bright_cyan")
-        exports["s7_orb"] = r7
-
-    if 8 in run:
-        r8 = s8_power_swing(data_map, info_map, pop_scores, bench_c=bench_c)
-        display("STRATEGY 8 — POWER SWING (1–2 WEEK HOLD)",
-                "Hybrid: pullback bounce to rising 9/20 EMA OR tight-base breakout on volume | small-mid friendly | tight 5–14% targets",
-                r8, "bright_green")
-        exports["s8_power_swing"] = r8
+    for key in sorted(run):
+        meta = STRATEGIES[key]
+        if key == 6:
+            sector_lb = exports.get("s6_sectors")
+            if sector_lb:
+                display("SECTOR HEAT MAP — Which sectors have money flowing in",
+                        "Sorted by momentum score — top 4 sectors feed stock picks below",
+                        sector_lb, meta["color"])
+            display(meta["cli_title"], meta["cli_subtitle"],
+                    exports.get("s6_sector_stocks"), meta["color"])
+        else:
+            display(meta["cli_title"], meta["cli_subtitle"],
+                    exports.get(meta["export"]), meta["color"])
 
     if args.export:
         ts = datetime.now().strftime("%Y%m%d_%H%M")
         for name, data in exports.items():
-            if data:
-                fname = f"{name}_{ts}.csv"
-                pd.DataFrame(data).to_csv(fname, index=False)
-                console.print(f"[green]💾 {fname}[/green]")
+            if name == "heat" or not data:      # heat is a dict of two lists, not a table
+                continue
+            fname = f"{name}_{ts}.csv"
+            pd.DataFrame(data).to_csv(fname, index=False)
+            console.print(f"[green]💾 {fname}[/green]")
 
     console.print(Panel(
         "[bold]WHEN TO RUN WHAT[/bold]\n\n"

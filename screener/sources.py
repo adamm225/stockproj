@@ -62,6 +62,15 @@ def _load_valid_tickers() -> set:
 VALID_TICKERS = _load_valid_tickers()
 
 
+def _symbol_ok(t: str) -> bool:
+    """One place that decides whether a scraped symbol is worth spending API
+    calls on: plain 1-5 letter common-stock ticker AND present in the real
+    NASDAQ+NYSE list (when that list has been generated). Rejects units/
+    warrants/preferreds (AAC.U, DSX.WS, AGM.A) and delisted or typo'd junk."""
+    return (1 <= len(t) <= 5 and t.isalpha()
+            and (not VALID_TICKERS or t in VALID_TICKERS))
+
+
 # ──────────────────────────────────────────────
 #  FINVIZ  (fixed v4 — proper selectors + retry)
 # ──────────────────────────────────────────────
@@ -1351,16 +1360,17 @@ def build_universe(sources: list, max_tickers: int = 500, show: bool = False,
     # ── Validity filter — drop anything not a real NASDAQ/NYSE ticker BEFORE
     # ranking/capping, so the Finnhub enrichment calls below (and every API call
     # after this point) never get spent on garbage/delisted/typo'd symbols. ──
-    if VALID_TICKERS:
-        before_n = len(combined)
-        combined = defaultdict(float, {t: s for t, s in combined.items() if t in VALID_TICKERS})
-        dropped = before_n - len(combined)
-        if dropped:
-            console.print(f"[dim]🧹 Filtered {dropped} tickers not in stockTickers.txt "
-                          f"(not real NASDAQ/NYSE symbols)[/dim]")
+    # Filter `combined` itself (not just the ranked view below), because the
+    # post-Finnhub re-rank re-reads `combined` — filtering only the view let
+    # every rejected symbol back into the final universe.
+    before_n = len(combined)
+    combined = defaultdict(float, {t: s for t, s in combined.items() if _symbol_ok(t)})
+    dropped = before_n - len(combined)
+    if dropped:
+        console.print(f"[dim]🧹 Filtered {dropped} symbols that aren't real NASDAQ/NYSE "
+                      f"common stock (not in stockTickers.txt, or a unit/warrant/preferred)[/dim]")
 
     ranked = sorted(combined.items(), key=lambda x: x[1], reverse=True)
-    ranked = [(t, s) for t, s in ranked if 1 <= len(t) <= 5 and t.isalpha()]
     top    = ranked[:max_tickers]
 
     console.print(f"\n[bold]📊 Base Universe: {len(top):,} tickers[/bold]\n")
@@ -1394,8 +1404,7 @@ def build_universe(sources: list, max_tickers: int = 500, show: bool = False,
     quality_pool  = defaultdict(float)
     for qname in QUALITY_TASKS:
         for t, s in raw_results.get(qname, {}).items():
-            if (1 <= len(t) <= 5 and t.isalpha() and t not in TICKER_BLACKLIST
-                    and (not VALID_TICKERS or t in VALID_TICKERS)):
+            if _symbol_ok(t) and t not in TICKER_BLACKLIST:
                 quality_pool[t] += s
 
     sleepers = []

@@ -38,6 +38,42 @@ def _is_blocked(ticker: str, info_map: dict, strategy: int) -> bool:
 
 
 # ──────────────────────────────────────────────
+#  PRICE BANDS
+#  Each strategy has a default price gate (S1's $0.50–$10 catalyst band, the
+#  per-strategy floors that keep sub-$1..$5 noise out of the swing screens).
+#  The UI can override that with an explicit (min, max) band — passed down as
+#  `price_band` — so a run can be re-pointed at "sub $20" or "$3–$8" without
+#  editing the strategies. Either end may be None, meaning "no bound".
+# ──────────────────────────────────────────────
+
+DEFAULT_PRICE_BANDS = {
+    1: (0.50, 10.0),   # catalyst band: cheap enough to move on volume
+    2: (5.0, None),
+    3: (1.0, None),
+    4: (5.0, None),
+    5: (2.0, None),
+    6: (2.0, None),
+    7: (1.0, None),
+    8: (3.0, None),    # small-mid friendly, skips sub-$3 noise
+}
+
+
+def price_in_band(price: float, strategy: int, price_band=None) -> bool:
+    """True when `price` sits inside the active band for this strategy.
+
+    `price_band` is an explicit (min, max) override; without one the strategy's
+    default from DEFAULT_PRICE_BANDS applies. Callers still gate on `relax`
+    themselves — rate_ticker() scores a single name with every gate off.
+    """
+    lo, hi = price_band if price_band else DEFAULT_PRICE_BANDS.get(strategy, (None, None))
+    if lo is not None and price < float(lo):
+        return False
+    if hi is not None and price > float(hi):
+        return False
+    return True
+
+
+# ──────────────────────────────────────────────
 #  INDUSTRY HEAT  (market context before Strategy 1)
 # ──────────────────────────────────────────────
 
@@ -371,7 +407,8 @@ def hop_verdict(score, phase):
 #  STRATEGY 1: HIGH RVOL / CATALYST
 # ──────────────────────────────────────────────
 
-def s1_catalyst(data_map, info_map, pop_scores, bench_c=None, premarket=None, intraday=None, news=None, relax=False):
+def s1_catalyst(data_map, info_map, pop_scores, bench_c=None, premarket=None, intraday=None, news=None,
+                relax=False, price_band=None):
     results = []
     pop_pct = _pop_percentile_map(pop_scores)   # 0–100 percentile, computed once
     hour    = _et_hour()                         # live ET session window for move typing
@@ -384,7 +421,7 @@ def s1_catalyst(data_map, info_map, pop_scores, bench_c=None, premarket=None, in
                 continue
             c, v, h, l, o = df["Close"], df["Volume"], df["High"], df["Low"], df["Open"]
             price = float(c.iloc[-1])
-            if not (0.50 <= price <= 10.0) and not relax:
+            if not relax and not price_in_band(price, 1, price_band):
                 continue
 
             rv      = rvol(v)
@@ -536,7 +573,7 @@ def s1_catalyst(data_map, info_map, pop_scores, bench_c=None, premarket=None, in
 #  STRATEGY 2: MOMENTUM SWING
 # ──────────────────────────────────────────────
 
-def s2_swing(data_map, info_map, pop_scores, bench_c=None, premarket=None, relax=False):
+def s2_swing(data_map, info_map, pop_scores, bench_c=None, premarket=None, relax=False, price_band=None):
     results = []
     for ticker, df in data_map.items():
         try:
@@ -546,7 +583,7 @@ def s2_swing(data_map, info_map, pop_scores, bench_c=None, premarket=None, relax
                 continue
             c, v, h, l = df["Close"], df["Volume"], df["High"], df["Low"]
             price = float(c.iloc[-1])
-            if price < 5 and not relax:
+            if not relax and not price_in_band(price, 2, price_band):
                 continue
 
             e20  = float(ema(c, 20).iloc[-1])
@@ -630,7 +667,7 @@ def s2_swing(data_map, info_map, pop_scores, bench_c=None, premarket=None, relax
 #  STRATEGY 3: GAP & BREAKOUT
 # ──────────────────────────────────────────────
 
-def s3_breakout(data_map, info_map, pop_scores, bench_c=None, premarket=None, relax=False):
+def s3_breakout(data_map, info_map, pop_scores, bench_c=None, premarket=None, relax=False, price_band=None):
     results = []
     for ticker, df in data_map.items():
         try:
@@ -640,7 +677,7 @@ def s3_breakout(data_map, info_map, pop_scores, bench_c=None, premarket=None, re
                 continue
             c, v, h, l, o = df["Close"], df["Volume"], df["High"], df["Low"], df["Open"]
             price   = float(c.iloc[-1])
-            if price < 1 and not relax:
+            if not relax and not price_in_band(price, 3, price_band):
                 continue
 
             gap_pct = (float(o.iloc[-1]) - float(c.iloc[-2])) / float(c.iloc[-2]) * 100
@@ -786,7 +823,7 @@ def s4_entry_timing(price, e50, e200, rsi_val, pos52):
     return "⚪ Fair", 1.0, ext50
 
 
-def s4_quality_compounder(data_map, info_map, pop_scores, bench_c=None, relax=False):
+def s4_quality_compounder(data_map, info_map, pop_scores, bench_c=None, relax=False, price_band=None):
     """4–6 month positional holds: quality businesses in Stage-2 uptrends with
     consistent growth, analyst support, and realistic volatility."""
     results = []
@@ -806,7 +843,7 @@ def s4_quality_compounder(data_map, info_map, pop_scores, bench_c=None, relax=Fa
             avg_vol    = float(v.iloc[-21:-1].mean())
             dollar_vol = price * avg_vol
             if not relax:
-                if price < 5:                 continue   # contrasts with S1's <$10 band
+                if not price_in_band(price, 4, price_band): continue   # contrasts with S1's <$10 band
                 if cap < 300e6:               continue   # small-cap+ allowed → more upside/volatility
                 if dollar_vol < 3e6:          continue   # ≥ $3M/day traded = still exitable
                 # Decent-business floor (NOT a profitability mandate): only drop names
@@ -960,7 +997,7 @@ def s4_quality_compounder(data_map, info_map, pop_scores, bench_c=None, relax=Fa
 #  STRATEGY 5: OVERSOLD REVERSAL HUNTER
 # ──────────────────────────────────────────────
 
-def s5_oversold_reversal(data_map, info_map, pop_scores, relax=False):
+def s5_oversold_reversal(data_map, info_map, pop_scores, relax=False, price_band=None):
     results = []
     for ticker, df in data_map.items():
         try:
@@ -970,7 +1007,7 @@ def s5_oversold_reversal(data_map, info_map, pop_scores, relax=False):
                 continue
             c, v, h, l, o = df["Close"], df["Volume"], df["High"], df["Low"], df["Open"]
             price = float(c.iloc[-1])
-            if price < 2 and not relax:
+            if not relax and not price_in_band(price, 5, price_band):
                 continue
 
             # — was it oversold? (gate: currently OR within last 10 days)
@@ -1110,7 +1147,7 @@ SECTOR_ETFS = {
     "ARK Innovation":   "ARKK",
 }
 
-def s6_sector_rotation(data_map, info_map, pop_scores, relax=False):
+def s6_sector_rotation(data_map, info_map, pop_scores, relax=False, price_band=None):
     sector_scores = {}
     sector_data   = {}
     for sector_name, etf_ticker in SECTOR_ETFS.items():
@@ -1172,7 +1209,7 @@ def s6_sector_rotation(data_map, info_map, pop_scores, relax=False):
                 continue
             c, v, h, l = df["Close"], df["Volume"], df["High"], df["Low"]
             price = float(c.iloc[-1])
-            if price < 2 and not relax:
+            if not relax and not price_in_band(price, 6, price_band):
                 continue
 
             e20  = float(ema(c, 20).iloc[-1])
@@ -1228,7 +1265,7 @@ def s6_sector_rotation(data_map, info_map, pop_scores, relax=False):
 #  STRATEGY 7: OPENING RANGE BREAKOUT (ORB)
 # ──────────────────────────────────────────────
 
-def s7_orb(data_map, info_map, pop_scores, bench_c=None, relax=False):
+def s7_orb(data_map, info_map, pop_scores, bench_c=None, relax=False, price_band=None):
     results = []
     for ticker, df in data_map.items():
         try:
@@ -1238,7 +1275,7 @@ def s7_orb(data_map, info_map, pop_scores, bench_c=None, relax=False):
                 continue
             c, v, h, l, o = df["Close"], df["Volume"], df["High"], df["Low"], df["Open"]
             price   = float(c.iloc[-1])
-            if price < 1 and not relax:
+            if not relax and not price_in_band(price, 7, price_band):
                 continue
 
             today_o = float(o.iloc[-1])
@@ -1329,7 +1366,7 @@ def s7_orb(data_map, info_map, pop_scores, bench_c=None, relax=False):
 #  Tight 1–2 week targets (≈5–14%), small-mid-cap friendly (price ≥ $3).
 # ──────────────────────────────────────────────
 
-def s8_power_swing(data_map, info_map, pop_scores, bench_c=None, relax=False):
+def s8_power_swing(data_map, info_map, pop_scores, bench_c=None, relax=False, price_band=None):
     results = []
     pop_pct = _pop_percentile_map(pop_scores)
     for ticker, df in data_map.items():
@@ -1340,7 +1377,7 @@ def s8_power_swing(data_map, info_map, pop_scores, bench_c=None, relax=False):
                 continue
             c, v, h, l, o = df["Close"], df["Volume"], df["High"], df["Low"], df["Open"]
             price = float(c.iloc[-1])
-            if price < 3 and not relax:        # small-mid friendly, skips sub-$3 noise
+            if not relax and not price_in_band(price, 8, price_band):    # small-mid friendly by default
                 continue
 
             e9s  = ema(c, 9);  e9  = float(e9s.iloc[-1]);  e9p  = float(e9s.iloc[-3])

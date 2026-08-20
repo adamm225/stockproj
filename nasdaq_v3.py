@@ -27,3 +27,14 @@ from screener.pipeline import main   # noqa: F401
 
 if __name__ == "__main__":
     main()
+
+'''
+
+
+New Plan:
+
+Once we retrieve all the proper tickers by comparing them to stockTickers.txt to see if they 
+are valid we move onto this next step 
+
+
+'''
